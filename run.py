@@ -9,9 +9,13 @@ import logging
 import os
 import shutil
 from typing import *
+import clip
 
+import faulthandler
+import torch.nn.functional as F
 import gin
 import torch
+from torch.utils.tensorboard import SummaryWriter   
 from pytorch_lightning import Trainer
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning import seed_everything
@@ -20,10 +24,102 @@ from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     TQDMProgressBar,
 )
-from pytorch_lightning.plugins import DDPPlugin
+#from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning.strategies import DDPStrategy
+from typing import *
+from src.data.data_util.nerf_360_v2 import load_nerf_360_v2_data
 
-from utils.select_option import select_callback, select_dataset, select_model
+from src.data.litdata import (
+    LitDataBlender,
+    LitDataBlenderMultiScale,
+    LitDataLF,
+    LitDataLLFF,
+    LitDataNeRF360V2,
+    LitDataRefNeRFReal,
+    LitDataShinyBlender,
+    LitDataTnT,
+)
 
+#from src.model.dvgo.model import LitDVGO
+from src.model.mipnerf360.model import LitMipNeRF360
+from src.model.mipnerf.model import LitMipNeRF
+from src.model.nerf.model import LitNeRF
+from src.model.nerfpp.model import LitNeRFPP
+from src.model.plenoxel.model import LitPlenoxel
+from src.model.refnerf.model import LitRefNeRF
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_float32_matmul_precision('high')
+
+#from select_option import select_callback, select_dataset, select_model
+
+def select_callback(model_name):
+
+    callbacks = []
+
+    if model_name == "plenoxel":
+        import src.model.plenoxel.model as model
+
+        callbacks += [model.ResampleCallBack()]
+
+    if model_name == "dvgo":
+        import src.model.dvgo.model as model
+
+        callbacks += [
+            model.Coarse2Fine(),
+            model.ProgressiveScaling(),
+            model.UpdateOccupancyMask(),
+        ]
+
+    return callbacks
+def select_dataset(
+    dataset_name: str,
+    datadir: str,
+    scene_name: str,
+    ):
+    if dataset_name == "blender":
+        data_fun = LitDataBlender
+    elif dataset_name == "blender_multiscale":
+        data_fun = LitDataBlenderMultiScale
+    elif dataset_name == "llff":
+        data_fun = LitDataLLFF
+    elif dataset_name == "tanks_and_temples":
+        data_fun = LitDataTnT
+    elif dataset_name == "lf":
+        data_fun = LitDataLF
+    elif dataset_name == "nerf_360_v2":
+        data_fun = LitDataNeRF360V2
+    elif dataset_name == "shiny_blender":
+        data_fun = LitDataShinyBlender
+    elif dataset_name == "refnerf_real":
+        data_fun = LitDataRefNeRFReal
+
+    return data_fun(
+        datadir=datadir,
+        scene_name=scene_name,
+    )
+def select_model(
+    model_name: str,
+    ):
+
+    if model_name == "nerf":
+        return LitNeRF()
+    elif model_name == "mipnerf":
+        return LitMipNeRF()
+    elif model_name == "plenoxel":
+        return LitPlenoxel()
+    elif model_name == "nerfpp":
+        return LitNeRFPP()
+    #elif model_name == "dvgo":
+    #    return LitDVGO()
+    elif model_name == "refnerf":
+        return LitRefNeRF()
+    elif model_name == "mipnerf360":
+        return LitMipNeRF360()
+
+    else:
+        raise f"Unknown model named {model_name}"
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -34,9 +130,73 @@ def str2bool(v):
         return False
     else:
         raise Exception("Boolean value expected.")
+'''
+def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False, clip_cache_root=None):
+    if model_type.startswith('clip_'):
+        if model_type == 'clip_rn50':
+            assert clip_cache_root
+            clip_utils.load_rn(jit=False, root=clip_cache_root)
+            if spatial:
+                _clip_dtype = clip_utils.clip_model_rn.clip_model.dtype
+                assert num_layers == -1
+                def embed(ims):
+                    ims = clip_utils.CLIP_NORMALIZE(ims).type(_clip_dtype)
+                    return clip_utils.clip_model_rn.clip_model.visual.featurize(ims)  # [N,C,56,56]
+            else:
+                embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers).unsqueeze(1)
+            assert not clip_utils.clip_model_rn.training
+        elif model_type.startswith('clip_vit'):
+            assert clip_cache_root
+            if model_type == 'clip_vit':
+                clip_utils.load_vit(root=clip_cache_root)
+            elif model_type == 'clip_vit_b16':
+                clip_utils.load_vit('ViT-B/16', root=clip_cache_root)
+            if spatial:
+                def embed(ims):
+                    emb = clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers)  # [N,L=50,D]
+                    return emb[:, 1:].view(emb.shape[0], 7, 7, emb.shape[2]).permute(0, 3, 1, 2)  # [N,D,7,7]
+            else:
+                embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers)  # [N,L=50,D]
+            assert not clip_utils.clip_model_vit.training
+        elif model_type == 'clip_rn50x4':
+            assert not spatial
+            clip_utils.load_rn(name='RN50x4', jit=False)
+            assert not clip_utils.clip_model_rn.training
+            embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims), featurize=False)
+    elif model_type.startswith('timm_'):
+        assert num_layers == -1
+        assert not spatial
+
+        model_type = model_type[len('timm_'):]
+        encoder = timm.create_model(model_type, pretrained=True, num_classes=0)
+        encoder.eval()
+        normalize = torchvision.transforms.Normalize(
+            encoder.default_cfg['mean'], encoder.default_cfg['std'])  # normalize an image that is already scaled to [0, 1]
+        encoder = nn.DataParallel(encoder).to(device)
+        embed = lambda ims: encoder(normalize(ims)).unsqueeze(1)
+    elif model_type.startswith('torch_'):
+        assert num_layers == -1
+        assert not spatial
+
+        model_type = model_type[len('torch_'):]
+        encoder = torch.hub.load('pytorch/vision:v0.6.0', model_type, pretrained=True)
+        encoder.eval()
+        encoder = nn.DataParallel(encoder).to(device)
+        normalize = torchvision.transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # normalize an image that is already scaled to [0, 1]
+        embed = lambda ims: encoder(normalize(ims)).unsqueeze(1)
+    else:
+        raise ValueError
+
+    if checkpoint:
+        return lambda x: run_checkpoint(embed, x)
+
+    return embed
+'''
 
 
 @gin.configurable()
+
 def run(
     ginc: str,
     ginb: str,
@@ -59,7 +219,7 @@ def run(
     # Run Mode
     run_train: bool = True,
     run_eval: bool = True,
-    run_render: bool = False,
+    run_render: bool = True,
     num_devices: Optional[int] = None,
     num_sanity_val_steps: int = 0,
     seed: int = 777,
@@ -69,7 +229,16 @@ def run(
     grad_clip_algorithm="norm",
 ):
 
+   # load codebook
+    
+    '''
+    vq_path = "/root/NeRF-Factory-main/NeRF-Factory-main/checkpoints/code.ckpt"
+    code_data = torch.load(vq_path, map_location="cpu")
+    state_dict = code_data.get("state_dict", {})
+    codebook = state_dict["quantize.embedding.weight"]
+    '''
     logging.getLogger("lightning").setLevel(logging.ERROR)
+    
     datadir = datadir.rstrip("/")
 
     exp_name = (
@@ -98,6 +267,7 @@ def run(
         save_dir=logdir,
         name=exp_name,
     )
+    faulthandler.enable()
     # Logging all parameters
     if run_train:
         txt_path = os.path.join(logdir, "config.gin")
@@ -133,7 +303,7 @@ def run(
     callbacks += [model_checkpoint, tqdm_progrss]
     callbacks += select_callback(model_name)
 
-    ddp_plugin = DDPPlugin(find_unused_parameters=False) if num_devices > 1 else None
+    ddp_plugin = DDPStrategy(find_unused_parameters=True) if num_devices > 1 else None
 
     trainer = Trainer(
         logger=logger if run_train else None,
@@ -161,8 +331,11 @@ def run(
         scene_name=scene_name,
         datadir=datadir,
     )
-
+    #xuanq
     model = select_model(model_name=model_name)
+
+
+    
     model.logdir = logdir
     if run_train:
         best_ckpt = os.path.join(logdir, "best.ckpt")
@@ -192,6 +365,8 @@ def run(
 
 
 if __name__ == "__main__":
+    import torch
+    torch.cuda.empty_cache()
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ginc",
@@ -218,8 +393,18 @@ if __name__ == "__main__":
         "--scene_name", type=str, default=None, help="scene name to render"
     )
     parser.add_argument("--seed", type=int, default=220901, help="seed to use")
+    '''
+     # Consistency model arguments
+    parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_vit_b16', 'clip_rn50']
+    parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
+    parser.add_argument("--clip_cache_root", type=str, default=os.path.expanduser("~/.cache/clip"))
+    parser.add_argument("--consistency_size", type=int, default=224)
+    parser.add_argument("--checkpoint_embedding", action='store_true')
+    parser.add_argument("--pixel_interp_mode", type=str, default='bicubic')
+    '''
+    #parser.add_argument("--local_rank", type=int)
     args = parser.parse_args()
-
+    #torch.cuda.set_device(args.local_rank)
     ginbs = []
     if args.ginb:
         ginbs.extend(args.ginb)
