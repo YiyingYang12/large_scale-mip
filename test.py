@@ -73,39 +73,51 @@ class CodebookAttention(nn.Module):
     cross_heads: int = 1
     cross_dim_head: int = 64
 
-    @nn.compact
-    def __call__(self, codebook):
+    def setup(self):
+        self.latents = self.param('latents', nn.initializers.normal(stddev=0.02),
+                                  (self.num_latents, self.latent_dim))
+
+        self.cross_attend_blocks = [PreNorm(self.latent_dim, MultiHeadDotProductAttention(self.latent_dim,
+                                                                  self.codebook_dim,
+                                                                  self.cross_heads,
+                                                                  self.cross_dim_head)),
+                                    PreNorm(self.latent_dim, Dense(self.latent_dim))]
+
+        self.self_attend_blocks = []
+        for i in range(self.depth):
+            self_attn = PreNorm(self.latent_dim, MultiHeadDotProductAttention(self.latent_dim,
+                                                                self.latent_heads,
+                                                                self.latent_dim_head))
+            self_ff = PreNorm(self.latent_dim, Dense(self.latent_dim))
+            self.self_attend_blocks.append([self_attn, self_ff])
+
+    def forward(self, codebook):
         """ Useful code items selection.
 
         Args:
-            codebook (jax.numpy.ndarray): [b, n, d]
+            codebook (jax.interpreters.xla.DeviceArray): [b, n, d]
 
         Returns:
-            x (jax.numpy.ndarray): [b, k, d]
+            x (jax.interpreters.xla.DeviceArray): [b, k, d]
         """
 
-        #b = codebook.shape[0]
+        b = codebook.shape[0]
 
-        x = self.param('latents', lambda key, shape: nn.initializers.normal(key, shape, dtype=jax.numpy.float32), (self.num_latents, self.latent_dim))
+        x = self.latents
+        x = x.expand((b,) + x.shape[1:])
 
-        cross_attn = nn.attention.Attention(self.latent_dim, self.codebook_dim, heads=self.cross_heads, key_dim=self.cross_dim_head, value_dim=self.cross_dim_head)
-        cross_ff = nn.Dense(self.latent_dim)
+        cross_attn, cross_ff = self.cross_attend_blocks
 
         # cross attention only happens once for Perceiver IO
         x = cross_attn(x, context=codebook) + x
         x = cross_ff(x) + x
 
         # self attention
-        for _ in range(self.depth):
-            self_attn = nn.attention.SelfAttention(self.latent_dim, num_heads=self.latent_heads, head_size=self.latent_dim_head)
-            self_ff = nn.Dense(self.latent_dim)
-
+        for self_attn, self_ff in self.self_attend_blocks:
             x = self_attn(x) + x
             x = self_ff(x) + x
 
         return x
-
-
 
 
 class CoordinateAttention(nn.Module):
