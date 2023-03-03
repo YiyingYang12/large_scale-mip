@@ -76,7 +76,13 @@ class Attention(nn.Module):
 
 
     
-    class CodebookAttention(nn.Module):
+ from flax import nn
+from jax import lax
+from jax import numpy as jnp
+from flax.nn import initializers
+
+
+class CodebookAttention(nn.Module):
     codebook_dim: int
     depth: int = 1
     num_latents: int = 512
@@ -96,95 +102,35 @@ class Attention(nn.Module):
         Returns:
             x (jax.numpy.ndarray): [b, k, d]
         """
+
         b, n, d = codebook.shape
 
-        latents = self.param('latents', lambda key: jax.random.normal(key, (self.num_latents, self.latent_dim)))
-        x = jnp.tile(latents, (b, 1, 1))
+        x = jnp.tile(self.param("latents", initializers.normal(), (self.num_latents, self.latent_dim)), (b, 1, 1))
 
-        # cross attention
-        cross_attn = nn.Sequential(
-            nn.LayerNorm(),
-            nn.MultiHeadAttention(num_heads=self.cross_heads, key_dim=self.latent_dim, value_dim=self.codebook_dim,
-                                  dropout=0.1),
-        )
+        cross_attn, cross_ff = self.cross_attend_blocks
 
-        cross_ff = nn.Sequential(
-            nn.LayerNorm(),
-            nn.Dense(features=self.latent_dim),
-            nn.Dropout(rate=0.1),
-            nn.Dense(features=self.latent_dim),
-        )
-
-        x = x + cross_attn(x, key=codebook, value=codebook)
-        x = x + cross_ff(x)
+        # cross attention only happens once for Perceiver IO
+        x = cross_attn(x, context=codebook) + x
+        x = cross_ff(x) + x
 
         # self attention
-        for _ in range(self.depth):
-            self_attn = nn.Sequential(
-                nn.LayerNorm(),
-                nn.MultiHeadAttention(num_heads=self.latent_heads, key_dim=self.latent_dim, value_dim=self.latent_dim_head,
-                                      dropout=0.1),
-            )
-
-            self_ff = nn.Sequential(
-                nn.LayerNorm(),
-                nn.Dense(features=self.latent_dim),
-                nn.Dropout(rate=0.1),
-                nn.Dense(features=self.latent_dim),
-            )
-
-            x = x + self_attn(x, key=x, value=x)
-            x = x + self_ff(x)
+        for self_attn, self_ff in self.self_attend_blocks:
+            x = self_attn(x) + x
+            x = self_ff(x) + x
 
         return x
-class CoordinateAttention(nn.Module):
-    queries_dim: int
-    depth: int = 1
-    activation: str = "geglu"
-    latent_dim: int = 128
-    cross_heads: int = 1
-    cross_dim_head: int = 64
-    decoder_ff: bool = True
 
-    @nn.compact
-    def __call__(self, queries, latents):
-        """ Query points features from the latents codebook.
+    def setup(self):
+        self.latents = self.param("latents", initializers.normal(), (self.num_latents, self.latent_dim))
+        self.cross_attend_blocks = nn.ModuleList([
+            PreNorm(self.latent_dim, Attention(self.latent_dim, self.codebook_dim, heads=self.cross_heads,
+                                          dim_head=self.cross_dim_head), context_dim=self.codebook_dim),
+            PreNorm(self.latent_dim, FeedForward(self.latent_dim))
+        ])
 
-        Args:
-            queries (jax.numpy.ndarray): [b, n, c], the sampled points.
-            latents (jax.numpy.ndarray): [b, n, k]
-
-        Returns:
-            x (jax.numpy.ndarray): [b, n, c]
-
-        """
-
-        x = queries
-
-        # cross attend from queries to latents
+        self.self_attend_blocks = nn.ModuleList([])
         for i in range(self.depth):
-            cross_attn = PreNorm(self.queries_dim, Attention(self.queries_dim, self.latent_dim,
-                                            heads=self.cross_heads, dim_head=self.cross_dim_head), 
-                                            context_dim=self.latent_dim)
+            self_attn = PreNorm(self.latent_dim, Attention(self.latent_dim, heads=self.latent_heads, dim_head=self.latent_dim_head))
+            self_ff = PreNorm(self.latent_dim, FeedForward(self.latent_dim))
 
-            ffn = nn.Sequential(
-                nn.Dense(self.queries_dim * 2, use_bias=True),
-                GEGLU() if self.activation == "geglu" else nn.gelu,
-                nn.Dense(self.queries_dim, use_bias=True)
-            )
-
-            if i == self.depth - 1 and self.decoder_ff:
-                cross_ff = PreNorm(self.queries_dim, ffn)
-            else:
-                cross_ff = None
-
-            cross_attn_output = cross_attn(x, context=latents)
-            x = cross_attn_output + x
-
-            if cross_ff is not None:
-                x = cross_ff(x) + x
-
-        return x
-
-    
-    
+            self.self_attend_blocks.append(nn.ModuleList([self_attn, self_ff]))
