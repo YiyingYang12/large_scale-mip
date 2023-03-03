@@ -63,19 +63,15 @@ class Attention(nn.Module):
 
         return out
 
-
-
-
-
 class CodebookAttention(nn.Module):
+    codebook_dim: int
+    depth: int = 1
     num_latents: int = 512
     latent_dim: int = 128
     latent_heads: int = 8
     latent_dim_head: int = 64
     cross_heads: int = 1
     cross_dim_head: int = 64
-    depth: int = 1
-    codebook_dim: int
 
     @nn.compact
     def __call__(self, codebook):
@@ -87,41 +83,25 @@ class CodebookAttention(nn.Module):
         Returns:
             x (jax.numpy.ndarray): [b, k, d]
         """
-        # initialize latents
-        latents = self.param('latents', nn.initializers.normal(stddev=1.), 
-                             (self.num_latents, self.latent_dim))
 
-        # repeat latents
-        b = codebook.shape[0]
-        x = latents.reshape((1, self.num_latents, self.latent_dim))
-        x = x.repeat((b, 1, 1))
+        #b = codebook.shape[0]
 
-        # cross attention
-        cross_attn = Attention(num_heads=self.cross_heads, 
-                                             key_dim=self.latent_dim_head, 
-                                             value_dim=self.latent_dim_head)
+        x = self.param('latents', lambda key, shape: nn.initializers.normal(key, shape, dtype=jax.numpy.float32), (self.num_latents, self.latent_dim))
+
+        cross_attn = nn.attention.Attention(self.latent_dim, self.codebook_dim, heads=self.cross_heads, key_dim=self.cross_dim_head, value_dim=self.cross_dim_head)
         cross_ff = nn.Dense(self.latent_dim)
+
+        # cross attention only happens once for Perceiver IO
+        x = cross_attn(x, context=codebook) + x
+        x = cross_ff(x) + x
+
+        # self attention
         for _ in range(self.depth):
-            x = nn.LayerNormalization()(x)
-            x = cross_attn(x, codebook, attention_axis=[1], 
-                           pos_emb=None, deterministic=True) + x
-            x = nn.LayerNormalization()(x)
-            x = cross_ff(x) + x
-
-            # self attention
-            self_attn = Attention(num_heads=self.latent_heads, 
-                                                key_dim=self.latent_dim_head, 
-                                                value_dim=self.latent_dim_head)
+            self_attn = nn.attention.SelfAttention(self.latent_dim, num_heads=self.latent_heads, head_size=self.latent_dim_head)
             self_ff = nn.Dense(self.latent_dim)
-            x_ = x
-            for _ in range(self.depth):
-                x_ = nn.LayerNormalization()(x_)
-                x_ = self_attn(x_, x_, attention_axis=[1], 
-                              pos_emb=None, deterministic=True) + x_
-                x_ = nn.LayerNormalization()(x_)
-                x_ = self_ff(x_) + x_
 
-            x = x_ + x
+            x = self_attn(x) + x
+            x = self_ff(x) + x
 
         return x
 
