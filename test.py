@@ -35,8 +35,10 @@ import torch
 from einops import  repeat
 from jax import lax
 from flax.linen import initializers
-
-
+import numpy as np
+from flax.core import freeze, unfreeze
+from jax import lax
+from jax.nn import initializers
 
 gin.config.external_configurable(math.safe_exp, module='math')
 gin.config.external_configurable(coord.contract, module='coord')
@@ -83,6 +85,27 @@ def exists(val):
 def default(val, d):
     return val if exists(val) else d
 
+'''
+class PreNorm(nn.Module):
+    dim: int
+    fn: nn.Module
+    context_dim: Optional[int] = None
+
+    @nn.compact
+    def __call__(self, x, **kwargs):
+        #x = nn.LayerNorm(use_bias=True)(x)
+        #x = nn.LayerNorm()(x)
+        x = nn.LayerNorm(scale_init=nn.initializers.ones)(x)
+        #x = nn.LayerNorm(scale=True)(x)
+        if exists(self.context_dim):
+            context = kwargs["context"]
+            context = context.astype(jnp.float32)
+            normed_context = nn.LayerNorm()(context)
+            kwargs.update(context=normed_context)
+            print(f"Shape of normed_context: {normed_context.shape}")
+        print(f"Shape of x: {x.shape}")
+        return self.fn(x, **kwargs)
+'''
 
 class PreNorm(nn.Module):
     dim: int
@@ -91,13 +114,39 @@ class PreNorm(nn.Module):
 
     @nn.compact
     def __call__(self, x, **kwargs):
-        x = nn.LayerNorm()(x)
-        if exists(self.context_dim):
+        epsilon = 1e-5
+        x_mean = jnp.mean(x, axis=-1, keepdims=True)
+        x_var = jnp.var(x, axis=-1, keepdims=True)
+        x = (x - x_mean) * jax.lax.rsqrt(x_var + epsilon)
+        x = self.fn(x, **kwargs)
+
+        if self.context_dim is not None:
             context = kwargs["context"]
             context = context.astype(jnp.float32)
-            normed_context = nn.LayerNorm()(context)
+            normed_context = (context - jnp.mean(context, axis=-1, keepdims=True)) * jax.lax.rsqrt(jnp.var(context, axis=-1, keepdims=True) + epsilon)
             kwargs.update(context=normed_context)
-        return self.fn(x, **kwargs)
+
+        x = x * jax.lax.rsqrt(x_var + epsilon) + x_mean
+        return x
+
+
+
+class PreNorm2(nn.Module):
+    dim: int
+    fn: Any
+    context_dim: Optional[int] = None
+    scale_init: Callable[[Tuple[int]], Any] = nn.initializers.ones
+    bias_init: Callable[[Tuple[int]], Any] = nn.initializers.zeros
+
+    @nn.compact
+    def __call__(self, x, context=None, **kwargs):
+        scale = self.param('scale', self.scale_init, (self.dim,))
+        bias = self.param('bias', self.bias_init, (self.dim,))
+        x = x + bias
+        x = self.fn(x, context=context, **kwargs)
+        x = nn.LayerNorm(axis=-1, scale_init=scale)(x)
+        return x
+
 
 
 class GEGLU(nn.Module):
@@ -131,8 +180,10 @@ class Attention(nn.Module):
         d = self.dim_head
 
         context = default(context, x)
-        q = nn.Dense(h * d, use_bias=False)(x)
-        kv = nn.Dense(2 * h * d, use_bias=False)(context)
+
+        q = jnp.dot(x, jnp.zeros((x.shape[-1], h * d), dtype=x.dtype))
+        kv = jnp.dot(context, jnp.zeros((context.shape[-1], 2 * h * d), dtype=context.dtype))
+
         k, v = jnp.split(kv, 2, axis=-1)
 
         q = jnp.reshape(q, (x.shape[0], x.shape[1], h, d))
@@ -152,9 +203,15 @@ class Attention(nn.Module):
         out = jnp.reshape(out, (x.shape[0], x.shape[1], h * d))
 
         # Project back to the original dimension
-        out = nn.Dense(self.query_dim)(out)
+        out = jnp.dot(out, jnp.zeros((h * d, self.query_dim), dtype=x.dtype))
 
         return out
+
+
+
+
+
+
 
 
 class CodebookAttention(nn.Module):
@@ -188,10 +245,8 @@ class CodebookAttention(nn.Module):
 
     def __call__(self, codebook):
         """ Useful code items selection.
-
         Args:
             codebook (jax.numpy.ndarray): [b, n, d]
-
         Returns:
             x (jax.numpy.ndarray): [b, k, d]
         """
@@ -214,6 +269,7 @@ class CodebookAttention(nn.Module):
 
 
 
+
 class FeedForwardNetwork(nn.Module):
     dim: int
     mult: int = 4
@@ -221,10 +277,12 @@ class FeedForwardNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.dim * self.mult * 2)(x)
+        hidden_dim = self.dim * self.mult * 2
+        x = jnp.dot(x, jnp.zeros((x.shape[-1], hidden_dim)))
         x = create_activation(name=self.activation)(x)
-        x = nn.Dense(self.dim)(x)
+        x = jnp.dot(x, jnp.zeros((hidden_dim, self.dim)))
         return x
+
 
 class CoordinateAttention(nn.Module):
     queries_dim: int
@@ -272,11 +330,6 @@ class CoordinateAttention(nn.Module):
                 x = cross_ff(x) + x
 
         return x
-
-
-
-    
-
 
 
 @gin.configurable
@@ -333,7 +386,7 @@ class Model(nn.Module):
     # being regularized.
     nerf_mlp = NerfMLP(self.codebook)
     prop_mlp = nerf_mlp if self.single_mlp else PropMLP(self.codebook)
-
+    #prop_mlp = nerf_mlp
     if self.num_glo_features > 0:
       if not zero_glo:
         # Construct/grab GLO vectors for the cameras of each input ray.
@@ -361,7 +414,7 @@ class Model(nn.Module):
 
     # Initialize the range of (normalized) distances for each ray to [0, 1],
     # and assign that single interval a weight of 1. These distances and weights
-    # will be repeatedly updated as we proceed through sampling levels.
+    # will be repeatedly updated as we proceed through sampling levels.optionally
     # `near_anneal_rate` can be used to anneal in the near bound at the start
     # of training, eg. 0.1 anneals in the bound over the first 10% of training.
     if self.near_anneal_rate is None:
@@ -658,8 +711,11 @@ class MLP(nn.Module):
             direction, min_deg=0, max_deg=self.deg_view, append_identity=True)
 
       self.dir_enc_fn = dir_enc_fn
+    self.latents = self.param('latents', lambda key, shape: jnp.zeros(shape, dtype=jnp.float32),
+                              (self.num_latents, self.latent_dim))
     
     codebook_dim = self.codebook.shape[1]
+    
     self.codebook_attn = CodebookAttention(
       codebook_dim=codebook_dim,
       depth=ndepth,
@@ -667,19 +723,18 @@ class MLP(nn.Module):
       latent_dim=latent_dim,
       latent_heads=latent_heads,
       latent_dim_head=latent_dim_head,
-      #cross_heads=cross_heads,
-      cross_heads=8,
+      cross_heads=cross_heads,
       cross_dim_head=cross_dim_head)
+  
     self.coordinate_attn = CoordinateAttention(
       queries_dim=input_dim,
       depth=num_cross_depth,
       activation=activation,
       latent_dim=latent_dim,
-      #cross_heads=cross_heads,
-      cross_heads=8,
+      cross_heads=cross_heads,
       cross_dim_head=cross_dim_head,
       decoder_ff=decoder_ff)
-      
+     
 
       
   @nn.compact
@@ -734,30 +789,28 @@ class MLP(nn.Module):
       x = coord.integrated_pos_enc(lifted_means, lifted_vars,
                                    self.min_deg_point, self.max_deg_point)
       codebook = self.codebook
+      codebook = repeat(codebook, "n d -> b n d", b=4096)
       #codebook
-      #points = x
-      #b ,n_1,n_2,n_3,c = x.shape
-      if x.ndim==3:
-        b,n,c=x.shape
-        m=x.size
-        codebook = repeat(codebook, "n d -> b n d", b=b)
-        latents = self.codebook_attn(codebook)
-        xx = x.reshape((b, int(m/(3*b)), 3))
-        points = self.coordinate_attn(xx, latents)
-        x = points.reshape((b , n, c))
-      else:
+      
+      print("x:",x.shape)
+      latents = self.codebook_attn(codebook)
+      print("latents:",latents.shape)
+      if x.ndim==5:
         b,n_1,n_2,n_3,c=x.shape
         m=x.size
-        codebook = repeat(codebook, "n d -> b n d", b=b)
-        latents = self.codebook_attn(codebook)
+        #latent = self.call("codebook_attn",codebook)
         xx = x.reshape((b, int(m/(3*b)), 3))
+        #xx = x.reshape((b, int(m/(3*b)), 3))
+        print("xx:",xx.shape)
+        print('Output shape from CoordinateAttention:', self.coordinate_attn(xx, latents).shape)
         points = self.coordinate_attn(xx, latents)
         x = points.reshape((b , n_1, n_2, n_3, c))
     
       #if codebook.ndim == 2:
       #codebook = repeat(codebook, "n d -> b n d", b=b)
-
-
+      #print("x:",x.shape)
+      
+      
       inputs = x
       # Evaluate network to produce the output density.
       for i in range(self.net_depth):
@@ -923,6 +976,7 @@ class MLP(nn.Module):
 @gin.configurable
 class NerfMLP(MLP):
   pass
+
 
 
 @gin.configurable
