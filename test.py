@@ -1067,3 +1067,8 @@ def render_image(render_fn: Callable[[jnp.array, utils.Rays],
 
   return rendering
 Donation is not implemented for cpu. See an explanation at https://jax.readthedocs.io/en/latest/faq.html#buffer-donation.
+  
+
+codebook_np = codebook_torch.numpy()
+
+2023-03-12 01:52:51.562 [horovod|11.216.72.237] TypeError: can't convert cuda:0 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.
