@@ -1066,3 +1066,4 @@ def render_image(render_fn: Callable[[jnp.array, utils.Rays],
       rendering[k] = [r[ray_idx] for r in rendering[k]]
 
   return rendering
+Donation is not implemented for cpu. See an explanation at https://jax.readthedocs.io/en/latest/faq.html#buffer-donation.
