@@ -1,55 +1,47 @@
-# Copyright 2022 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     https://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# ------------------------------------------------------------------------------------
+# NeRF-Factory
+# Copyright (c) 2022 POSTECH, KAIST, Kakao Brain Corp. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------
+# Modified from Mip-NeRF360 (https://github.com/google-research/multinerf)
+# Copyright (c) 2022 Google LLC. All Rights Reserved.
+# ------------------------------------------------------------------------------------
 
-"""NeRF and its MLPs, with helper functions for construction and rendering."""
-
-import functools
-from typing import Any, Callable, List, Mapping, MutableMapping, Optional, Text, Tuple
-
-from flax import linen as nn
+import os
+from typing import *
+import ipdb
+from typing import List, Optional
 import gin
-from internal import configs
-from internal import coord
-from internal import geopoly
-from internal import image
-from internal import math
-from internal import ref_utils
-from internal import render
-from internal import stepfun
-from internal import utils
-import jax
-from jax import random
-import jax.numpy as jnp
-import torch
-from einops import  repeat
-from jax import lax
-from flax.linen import initializers
+import pandas as pd
 import numpy as np
-from flax.core import freeze, unfreeze
-from jax import lax
-from jax.nn import initializers
+import torch
+import torch.nn as nn
+import torch.nn.init as init
+import torch.nn.functional as F
+from einops import rearrange, repeat
+import clip
+from torch.utils.tensorboard import SummaryWriter
+import MinkowskiEngine as ME
+#import MinkowskiEngine.MinkowskiFunctional as MF
+#from MinkowskiEngine.utils import sparse_collate
 
-gin.config.external_configurable(math.safe_exp, module='math')
-gin.config.external_configurable(coord.contract, module='coord')
+import helper as helper
+#import utils.store_image as store_image
+from interfacesrc import LitModel
+from PIL import Image
 
 
-def random_split(rng):
-  if rng is None:
-    key = None
-  else:
-    key, rng = random.split(rng)
-  return key, rng
+def to8b(x):
+    return (255 * np.clip(x, 0, 1)).astype(np.uint8)
+
+def store_image(dirpath, rgbs):
+    for (i, rgb) in enumerate(rgbs):
+        imgname = f"image{str(i).zfill(3)}.jpg"
+        rgbimg = Image.fromarray(to8b(rgb.detach().cpu().numpy()))
+        imgpath = os.path.join(dirpath, imgname)
+        rgbimg.save(imgpath)
+
 
 def exists(val):
     return val is not None
@@ -61,15 +53,14 @@ def default(val, d):
 
 def create_activation(name, **kwargs):
     if name == "relu":
-        act = jax.nn.relu
+        act = nn.ReLU(inplace=True)
 
     elif name == "softplus":
-        #beta = kwargs.get("beta", 100)
-        #act = jax.nn.softplus()
-        act = jax.nn.silu
+        beta = kwargs.get("beta", 100)
+        act = nn.Softplus(beta=beta)
 
     elif name == "gelu":
-        act = jax.nn.gelu
+        act = nn.GELU()
 
     elif name == "GEGLU":
         act = GEGLU()
@@ -79,180 +70,176 @@ def create_activation(name, **kwargs):
 
     return act
 
-def exists(val):
-    return val is not None
 
-def default(val, d):
-    return val if exists(val) else d
-
-'''
 class PreNorm(nn.Module):
-    dim: int
-    fn: nn.Module
-    context_dim: Optional[int] = None
+    def __init__(self, dim, fn, context_dim=None):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
+        self.norm_context = nn.LayerNorm(context_dim) if exists(context_dim) else None
 
-    @nn.compact
-    def __call__(self, x, **kwargs):
-        #x = nn.LayerNorm(use_bias=True)(x)
-        #x = nn.LayerNorm()(x)
-        x = nn.LayerNorm(scale_init=nn.initializers.ones)(x)
-        #x = nn.LayerNorm(scale=True)(x)
-        if exists(self.context_dim):
-            context = kwargs["context"]
-            context = context.astype(jnp.float32)
-            normed_context = nn.LayerNorm()(context)
+    def forward(self, x, **kwargs):
+        x = self.norm(x)
+        if exists(self.norm_context):
+            context = kwargs["context"].to('cuda')
+            normed_context = self.norm_context(context)
             kwargs.update(context=normed_context)
-            print(f"Shape of normed_context: {normed_context.shape}")
-        print(f"Shape of x: {x.shape}")
         return self.fn(x, **kwargs)
-'''
-
-class PreNorm(nn.Module):
-    dim: int
-    fn: nn.Module
-    context_dim: Optional[int] = None
-
-    @nn.compact
-    def __call__(self, x, **kwargs):
-        epsilon = 1e-5
-        x_mean = jnp.mean(x, axis=-1, keepdims=True)
-        x_var = jnp.var(x, axis=-1, keepdims=True)
-        x = (x - x_mean) * jax.lax.rsqrt(x_var + epsilon)
-        x = self.fn(x, **kwargs)
-
-        if self.context_dim is not None:
-            context = kwargs["context"]
-            context = context.astype(jnp.float32)
-            normed_context = (context - jnp.mean(context, axis=-1, keepdims=True)) * jax.lax.rsqrt(jnp.var(context, axis=-1, keepdims=True) + epsilon)
-            kwargs.update(context=normed_context)
-
-        x = x * jax.lax.rsqrt(x_var + epsilon) + x_mean
-        return x
-
-
-
-class PreNorm2(nn.Module):
-    dim: int
-    fn: Any
-    context_dim: Optional[int] = None
-    scale_init: Callable[[Tuple[int]], Any] = nn.initializers.ones
-    bias_init: Callable[[Tuple[int]], Any] = nn.initializers.zeros
-
-    @nn.compact
-    def __call__(self, x, context=None, **kwargs):
-        scale = self.param('scale', self.scale_init, (self.dim,))
-        bias = self.param('bias', self.bias_init, (self.dim,))
-        x = x + bias
-        x = self.fn(x, context=context, **kwargs)
-        x = nn.LayerNorm(axis=-1, scale_init=scale)(x)
-        return x
-
 
 
 class GEGLU(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        x1, x2 = jnp.split(x, 2, axis=-1)
-        gates = nn.gelu(x2)
-        return x1 * gates
+    def forward(self, x):
+        x, gates = x.chunk(2, dim=-1)
+        return x * F.gelu(gates)
 
 
 class FeedForward(nn.Module):
-    dim: int
-    mult: int = 4
+    def __init__(self, dim, mult=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim * mult * 2),
+            GEGLU(),
+            nn.Linear(dim * mult, dim)
+        )
 
-    @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(self.dim * self.mult * 2)(x)
-        x = GEGLU()(x)
-        x = nn.Dense(self.dim)(x)
-        return x
+    def forward(self, x):
+        return self.net(x)
+
 
 class Attention(nn.Module):
-    heads: int
-    dim_head: int
-    query_dim: int
-    context_dim: Optional[int] = None
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+        self.scale = dim_head ** -0.5
+        self.heads = heads
 
-    @nn.compact
-    def __call__(self, x, context=None, mask=None):
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=False)
+        self.to_out = nn.Linear(inner_dim, query_dim)
+
+    def forward(self, x, context=None, mask=None):
         h = self.heads
-        d = self.dim_head
 
+        q = self.to_q(x)
         context = default(context, x)
+        k, v = self.to_kv(context).chunk(2, dim=-1)
 
-        q = jnp.dot(x, jnp.zeros((x.shape[-1], h * d), dtype=x.dtype))
-        kv = jnp.dot(context, jnp.zeros((context.shape[-1], 2 * h * d), dtype=context.dtype))
+        q, k, v = map(lambda t: rearrange(t, "b n (h d) -> (b h) n d", h=h), (q, k, v))
 
-        k, v = jnp.split(kv, 2, axis=-1)
-
-        q = jnp.reshape(q, (x.shape[0], x.shape[1], h, d))
-        k = jnp.reshape(k, (context.shape[0], context.shape[1], h, d))
-        v = jnp.reshape(v, (context.shape[0], context.shape[1], h, d))
-
-        # Compute scaled dot-product attention
-        sim = jnp.einsum('...ihd,...jhd->...ijh', q, k) * (d ** -0.5)
+        sim = torch.einsum("b i d, b j d -> b i j", q, k) * self.scale
 
         if exists(mask):
-            mask = jnp.reshape(mask, (x.shape[0], 1, 1, x.shape[1]))
-            sim = jnp.where(mask, sim, -1e9)
+            mask = rearrange(mask, "b ... -> b (...)")
+            max_neg_value = -torch.finfo(sim.dtype).max
+            mask = repeat(mask, "b j -> (b h) () j", h=h)
+            sim.masked_fill_(~mask, max_neg_value)
 
-        attn = jax.nn.softmax(sim, axis=-1)
+        # attention, what we cannot get enough of
+        attn = sim.softmax(dim=-1)
 
-        out = jnp.einsum('...ijh,...jhd->...ihd', attn, v)
-        out = jnp.reshape(out, (x.shape[0], x.shape[1], h * d))
+        out = torch.einsum("b i j, b j d -> b i d", attn, v)
+        out = rearrange(out, "(b h) n d -> b n (h d)", h=h)
 
-        # Project back to the original dimension
-        out = jnp.dot(out, jnp.zeros((h * d, self.query_dim), dtype=x.dtype))
-
-        return out
-
-
-
-
-
-
+        return self.to_out(out)
 
 
 class CodebookAttention(nn.Module):
-    codebook_dim: int
-    depth: int = 1
-    num_latents: int = 512
-    latent_dim: int = 128
-    latent_heads: int = 8
-    latent_dim_head: int = 64
-    cross_heads: int = 8
-    cross_dim_head: int = 128
+    def __init__(self, *,
+                 codebook_dim,
+                 depth: int = 1,
+                 num_latents: int = 512,
+                 latent_dim: int = 128,
+                 latent_heads: int = 8,
+                 latent_dim_head: int = 64,
+                 cross_heads: int = 1,
+                 cross_dim_head: int = 64):
 
-    def setup(self):
-        self.latents = self.param('latents', lambda key, shape: jnp.zeros(shape, dtype=jnp.float32),
-                                  (self.num_latents, self.latent_dim))
+        super().__init__()
 
-        self.cross_attend_blocks = [
-            PreNorm(self.latent_dim, Attention(query_dim=self.latent_dim, context_dim=self.codebook_dim, heads=self.cross_heads,
-                                               dim_head=self.cross_dim_head), context_dim=self.codebook_dim),
-            PreNorm(self.latent_dim, FeedForward(self.latent_dim))
-        ]
+        self.latents = nn.Parameter(torch.randn((num_latents, latent_dim), dtype=torch.float32))
 
-        self.self_attend_blocks_tuple = []
-        for i in range(self.depth):
-            self_attn = PreNorm(self.latent_dim, Attention(query_dim=self.latent_dim, heads=self.latent_heads, dim_head=self.latent_dim_head))
-            self_ff = PreNorm(self.latent_dim, FeedForward(self.latent_dim))
-            #self_attnff = [self_attn,self_ff]
-            self.self_attend_blocks_tuple = self.self_attend_blocks_tuple + ([self_attn,self_ff],)
-            self.self_attend_blocks=list(self.self_attend_blocks_tuple)
-            #self.self_attend_blocks.append(self_attnff)
+        self.cross_attend_blocks = nn.ModuleList([
+            PreNorm(latent_dim, Attention(latent_dim, codebook_dim, heads=cross_heads,
+                                          dim_head=cross_dim_head), context_dim=codebook_dim),
+            PreNorm(latent_dim, FeedForward(latent_dim))
+        ])
 
-    def __call__(self, codebook):
+        self.self_attend_blocks = nn.ModuleList([])
+        for i in range(depth):
+            self_attn = PreNorm(latent_dim, Attention(latent_dim, heads=latent_heads, dim_head=latent_dim_head))
+            self_ff = PreNorm(latent_dim, FeedForward(latent_dim))
+
+            self.self_attend_blocks.append(nn.ModuleList([self_attn, self_ff]))
+
+    def forward(self, codebook):
         """ Useful code items selection.
+
         Args:
-            codebook (jax.numpy.ndarray): [b, n, d]
+            codebook (torch.Tensor): [b, n, d]
+
         Returns:
-            x (jax.numpy.ndarray): [b, k, d]
+            x (torch.Tensor): [b, k, d]
         """
+
+        #b = codebook.shape[0]
+
+        x = repeat(self.latents, "k d -> b k d", b=b)
+
+        cross_attn, cross_ff = self.cross_attend_blocks
+
+        # cross attention only happens once for Perceiver IO
+        x = cross_attn(x, context=codebook) + x
+        x = cross_ff(x) + x
+
+        # self attention
+        for self_attn, self_ff in self.self_attend_blocks:
+            x = self_attn(x) + x
+            x = self_ff(x) + x
+
+        return x
+
+class CodebookAttention(nn.Module):
+    def __init__(self, *,
+                 codebook_dim,
+                 depth: int = 1,
+                 num_latents: int = 512,
+                 latent_dim: int = 128,
+                 latent_heads: int = 8,
+                 latent_dim_head: int = 64,
+                 cross_heads: int = 1,
+                 cross_dim_head: int = 64):
+
+        super().__init__()
+
+        self.latents = nn.Parameter(torch.randn((num_latents, latent_dim), dtype=torch.float32))
+
+        self.cross_attend_blocks = nn.ModuleList([
+            PreNorm(latent_dim, Attention(latent_dim, codebook_dim, heads=cross_heads,
+                                          dim_head=cross_dim_head), context_dim=codebook_dim),
+            PreNorm(latent_dim, FeedForward(latent_dim))
+        ])
+
+        self.self_attend_blocks = nn.ModuleList([])
+        for i in range(depth):
+            self_attn = PreNorm(latent_dim, Attention(latent_dim, heads=latent_heads, dim_head=latent_dim_head))
+            self_ff = PreNorm(latent_dim, FeedForward(latent_dim))
+
+            self.self_attend_blocks.append(nn.ModuleList([self_attn, self_ff]))
+
+    def forward(self, codebook):
+        """ Useful code items selection.
+
+        Args:
+            codebook (torch.Tensor): [b, n, d]
+
+        Returns:
+            x (torch.Tensor): [b, k, d]
+        """
+
         b = codebook.shape[0]
 
-        x = jnp.tile(self.latents, (b, 1, 1))
+        x = repeat(self.latents, "k d -> b k d", b=b)
 
         cross_attn, cross_ff = self.cross_attend_blocks
 
@@ -268,62 +255,61 @@ class CodebookAttention(nn.Module):
         return x
 
 
-
-
-class FeedForwardNetwork(nn.Module):
-    dim: int
-    mult: int = 4
-    activation: str = "geglu"
-
-    @nn.compact
-    def __call__(self, x):
-        hidden_dim = self.dim * self.mult * 2
-        x = jnp.dot(x, jnp.zeros((x.shape[-1], hidden_dim)))
-        x = create_activation(name=self.activation)(x)
-        x = jnp.dot(x, jnp.zeros((hidden_dim, self.dim)))
-        return x
-
-
 class CoordinateAttention(nn.Module):
-    queries_dim: int
-    depth: int = 1
-    activation: str = "geglu"
-    latent_dim: int = 128
-    cross_heads: int = 1
-    cross_dim_head: int = 64
-    decoder_ff: bool = True
+    def __init__(self, *,
+                 queries_dim,
+                 depth: int = 1,
+                 activation: str = "geglu",
+                 latent_dim: int = 128,
+                 cross_heads: int = 1,
+                 cross_dim_head: int = 64,
+                 decoder_ff: bool = True):
 
-    @nn.compact
-    def __call__(self, queries, latents):
-        """ Query points features from the latents codebook.
+        super().__init__()
 
-        Args:
-            queries (jax.numpy.ndarray): [b, n, c], the sampled points.
-            latents (jax.numpy.ndarray): [b, n, k]
+        self.cross_attn = PreNorm(queries_dim, Attention(queries_dim, latent_dim, heads=cross_heads,
+                                                         dim_head=cross_dim_head), context_dim=latent_dim)
 
-        Returns:
-            x (jax.numpy.ndarray): [b, n, c]
+        if activation == "geglu":
+            hidden_dim = queries_dim * 2
+        else:
+            hidden_dim = queries_dim
 
-        """
-        x = queries
+        self.cross_attend_blocks = nn.ModuleList()
 
-        # cross attend from queries to latents
-        cross_attend_blocks = []
+        for i in range(depth):
+            cross_attn = PreNorm(queries_dim, Attention(queries_dim, latent_dim, heads=cross_heads,
+                                                        dim_head=cross_dim_head), context_dim=latent_dim)
 
-        for i in range(self.depth):
-            cross_attn = PreNorm(self.queries_dim, Attention(query_dim=self.queries_dim, context_dim=self.latent_dim, heads=self.cross_heads,
-                                                             dim_head=self.cross_dim_head), context_dim=self.latent_dim)
+            ffn = nn.Sequential(
+                nn.Linear(queries_dim, hidden_dim),
+                create_activation(name=activation),
+                nn.Linear(hidden_dim, queries_dim)
+            )
 
-            ffn = FeedForwardNetwork(dim=self.queries_dim, mult=4, activation=self.activation)
-
-            if i == self.depth - 1 and self.decoder_ff:
-                cross_ff = PreNorm(self.queries_dim, ffn)
+            if i == depth - 1 and decoder_ff:
+                cross_ff = PreNorm(queries_dim, ffn)
             else:
                 cross_ff = None
 
-            cross_attend_blocks.append([cross_attn, cross_ff])
+            self.cross_attend_blocks.append(nn.ModuleList([cross_attn, cross_ff]))
 
-        for cross_attn, cross_ff in cross_attend_blocks:
+    def forward(self, queries, latents):
+        """ Query points features from the latents codebook.
+
+        Args:
+            queries (torch.Tensor): [b, n, c], the sampled points.
+            latents (torch.Tensor): [b, n, k]
+
+        Returns:
+            x (torch.Tensor): [b, n, c]
+
+        """
+
+        x = queries
+
+        # cross attend from queries to latents
+        for cross_attn, cross_ff in self.cross_attend_blocks:
             x = cross_attn(x, context=latents) + x
 
             if cross_ff is not None:
@@ -332,743 +318,781 @@ class CoordinateAttention(nn.Module):
         return x
 
 
-@gin.configurable
-class Model(nn.Module):
-  """A mip-Nerf360 model containing all MLPs."""
-  codebook: jnp.ndarray
-  config: Any = None  # A Config class, must be set upon construction.
-  num_prop_samples: int = 64  # The number of samples for each proposal level.
-  num_nerf_samples: int = 32  # The number of samples the final nerf level.
-  num_levels: int = 3  # The number of sampling levels (3==2 proposals, 1 nerf).
-  bg_intensity_range: Tuple[float] = (1., 1.)  # The range of background colors.
-  anneal_slope: float = 10  # Higher = more rapid annealing.
-  stop_level_grad: bool = True  # If True, don't backprop across levels.
-  use_viewdirs: bool = True  # If True, use view directions as input.
-  raydist_fn: Callable[..., Any] = None  # The curve used for ray dists.
-  ray_shape: str = 'cone'  # The shape of cast rays ('cone' or 'cylinder').
-  disable_integration: bool = False  # If True, use PE instead of IPE.
-  single_jitter: bool = True  # If True, jitter whole rays instead of samples.
-  dilation_multiplier: float = 0.5  # How much to dilate intervals relatively.
-  dilation_bias: float = 0.0025  # How much to dilate intervals absolutely.
-  num_glo_features: int = 0  # GLO vector length, disabled if 0.
-  num_glo_embeddings: int = 1000  # Upper bound on max number of train images.
-  learned_exposure_scaling: bool = False  # Learned exposure scaling (RawNeRF).
-  near_anneal_rate: Optional[float] = None  # How fast to anneal in near bound.
-  near_anneal_init: float = 0.95  # Where to initialize near bound (in [0, 1]).
-  single_mlp: bool = False  # Use the NerfMLP for all rounds of sampling.
-  resample_padding: float = 0.0  # Dirichlet/alpha "padding" on the histogram.
-  use_gpu_resampling: bool = False  # Use gather ops for faster GPU resampling.
-  opaque_background: bool = False  # If true, make the background opaque.
 
-  @nn.compact
-  def __call__(
-      self,
-      rng,
-      rays,
-      train_frac,
-      compute_extras,
-      zero_glo=True,
-  ):
-    """The mip-NeRF Model.
+@gin.configurable()
+class MipNeRF360MLP(nn.Module):
+    def __init__(
+        self,
+        codebook,
+        input_dim: int = 3,
+        netdepth: int = 8,
+        netwidth: int = 256,
+        bottleneck_width: int = 256,
+        netdepth_condition: int = 1,
+        netwidth_condition: int = 128,
+        min_deg_point: int = 0,
+        max_deg_point: int = 11,
+        skip_layer: int = 4,
+        skip_layer_dir: int = 4,
+        num_rgb_channels: int = 3,
+        num_density_channels: int = 1,
+        deg_view: int = 4,
+        bottleneck_noise: float = 0.0,
+        density_bias: float = -1.0,
+        density_noise: float = 0.0,
+        rgb_premultiplier: float = 1.0,
+        rgb_bias: float = 0.0,
+        rgb_padding: float = 0.001,
+        basis_shape: str = "icosahedron",
+        basis_subdivision: int = 2,
+        disable_rgb: bool = False,
+        num_latents: int = 8,
+        latent_dim: int = 1,
+        latent_heads: int = 4,
+        latent_dim_head=64,
+        num_cross_depth: int = 1,
+        cross_heads: int = 1,
+        cross_dim_head: int = 64,
+        decoder_ff: bool = True,
+        ndepth: int = 1,
+        activation: str = "softplus",
+        ):
+        super(MipNeRF360MLP, self).__init__()
+        for name, value in vars().items():
+            if name not in ["self", "__class__"]:
+                setattr(self, name, value)
+        
+        #super(MipNeRF360MLP, self).__init__()
 
-    Args:
-      rng: random number generator (or None for deterministic output).
-      rays: util.Rays, a pytree of ray origins, directions, and viewdirs.
-      train_frac: float in [0, 1], what fraction of training is complete.
-      compute_extras: bool, if True, compute extra quantities besides color.
-      zero_glo: bool, if True, when using GLO pass in vector of zeros.
+        self.net_activation = nn.ReLU()
+        self.density_activation = nn.Softplus()
+        self.rgb_activation = nn.Sigmoid()
+        self.warp_fn = helper.contract
+        self.register_buffer(
+            "pos_basis_t", helper.generate_basis(basis_shape, basis_subdivision)
+        )
+                
 
-    Returns:
-      ret: list, [*(rgb, distance, acc)]
-    """
-
-    # Construct MLPs. WARNING: Construction order may matter, if MLP weights are
-    # being regularized.
-    nerf_mlp = NerfMLP(self.codebook)
-    prop_mlp = nerf_mlp if self.single_mlp else PropMLP(self.codebook)
-    #prop_mlp = nerf_mlp
-    if self.num_glo_features > 0:
-      if not zero_glo:
-        # Construct/grab GLO vectors for the cameras of each input ray.
-        glo_vecs = nn.Embed(self.num_glo_embeddings, self.num_glo_features)
-        cam_idx = rays.cam_idx[..., 0]
-        glo_vec = glo_vecs(cam_idx)
-      else:
-        glo_vec = jnp.zeros(rays.origins.shape[:-1] + (self.num_glo_features,))
-    else:
-      glo_vec = None
-
-    if self.learned_exposure_scaling:
-      # Setup learned scaling factors for output colors.
-      max_num_exposures = self.num_glo_embeddings
-      # Initialize the learned scaling offsets at 0.
-      init_fn = jax.nn.initializers.zeros
-      exposure_scaling_offsets = nn.Embed(
-          max_num_exposures,
-          features=3,
-          embedding_init=init_fn,
-          name='exposure_scaling_offsets')
-
-    # Define the mapping from normalized to metric ray distance.
-    _, s_to_t = coord.construct_ray_warps(self.raydist_fn, rays.near, rays.far)
-
-    # Initialize the range of (normalized) distances for each ray to [0, 1],
-    # and assign that single interval a weight of 1. These distances and weights
-    # will be repeatedly updated as we proceed through sampling levels.optionally
-    # `near_anneal_rate` can be used to anneal in the near bound at the start
-    # of training, eg. 0.1 anneals in the bound over the first 10% of training.
-    if self.near_anneal_rate is None:
-      init_s_near = 0.
-    else:
-      init_s_near = jnp.clip(1 - train_frac / self.near_anneal_rate, 0,
-                             self.near_anneal_init)
-    init_s_far = 1.
-    sdist = jnp.concatenate([
-        jnp.full_like(rays.near, init_s_near),
-        jnp.full_like(rays.far, init_s_far)
-    ],
-                            axis=-1)
-    weights = jnp.ones_like(rays.near)
-    prod_num_samples = 1
-
-    ray_history = []
-    renderings = []
-    for i_level in range(self.num_levels):
-      is_prop = i_level < (self.num_levels - 1)
-      num_samples = self.num_prop_samples if is_prop else self.num_nerf_samples
-
-      # Dilate by some multiple of the expected span of each current interval,
-      # with some bias added in.
-      dilation = self.dilation_bias + self.dilation_multiplier * (
-          init_s_far - init_s_near) / prod_num_samples
-
-      # Record the product of the number of samples seen so far.
-      prod_num_samples *= num_samples
-
-      # After the first level (where dilation would be a no-op) optionally
-      # dilate the interval weights along each ray slightly so that they're
-      # overestimates, which can reduce aliasing.
-      use_dilation = self.dilation_bias > 0 or self.dilation_multiplier > 0
-      if i_level > 0 and use_dilation:
-        sdist, weights = stepfun.max_dilate_weights(
-            sdist,
-            weights,
-            dilation,
-            domain=(init_s_near, init_s_far),
-            renormalize=True)
-        sdist = sdist[..., 1:-1]
-        weights = weights[..., 1:-1]
-
-      # Optionally anneal the weights as a function of training iteration.
-      if self.anneal_slope > 0:
-        # Schlick's bias function, see https://arxiv.org/abs/2010.09714
-        bias = lambda x, s: (s * x) / ((s - 1) * x + 1)
-        anneal = bias(train_frac, self.anneal_slope)
-      else:
-        anneal = 1.
-
-      # A slightly more stable way to compute weights**anneal. If the distance
-      # between adjacent intervals is zero then its weight is fixed to 0.
-      logits_resample = jnp.where(
-          sdist[..., 1:] > sdist[..., :-1],
-          anneal * jnp.log(weights + self.resample_padding), -jnp.inf)
-
-      # Draw sampled intervals from each ray's current weights.
-      key, rng = random_split(rng)
-      sdist = stepfun.sample_intervals(
-          key,
-          sdist,
-          logits_resample,
-          num_samples,
-          single_jitter=self.single_jitter,
-          domain=(init_s_near, init_s_far),
-          use_gpu_resampling=self.use_gpu_resampling)
-
-      # Optimization will usually go nonlinear if you propagate gradients
-      # through sampling.
-      if self.stop_level_grad:
-        sdist = jax.lax.stop_gradient(sdist)
-
-      # Convert normalized distances to metric distances.
-      tdist = s_to_t(sdist)
-
-      # Cast our rays, by turning our distance intervals into Gaussians.
-      gaussians = render.cast_rays(
-          tdist,
-          rays.origins,
-          rays.directions,
-          rays.radii,
-          self.ray_shape,
-          diag=False)
-
-      if self.disable_integration:
-        # Setting the covariance of our Gaussian samples to 0 disables the
-        # "integrated" part of integrated positional encoding.
-        gaussians = (gaussians[0], jnp.zeros_like(gaussians[1]))
-
-      # Push our Gaussians through one of our two MLPs.
-      mlp = prop_mlp if is_prop else nerf_mlp
-      key, rng = random_split(rng)
-      ray_results = mlp(
-          key,
-          gaussians,
-          viewdirs=rays.viewdirs if self.use_viewdirs else None,
-          imageplane=rays.imageplane,
-          glo_vec=None if is_prop else glo_vec,
-          exposure=rays.exposure_values,
-      )
-
-      # Get the weights used by volumetric rendering (and our other losses).
-      weights = render.compute_alpha_weights(
-          ray_results['density'],
-          tdist,
-          rays.directions,
-          opaque_background=self.opaque_background,
-      )[0]
-
-      # Define or sample the background color for each ray.
-      if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
-        # If the min and max of the range are equal, just take it.
-        bg_rgbs = self.bg_intensity_range[0]
-      elif rng is None:
-        # If rendering is deterministic, use the midpoint of the range.
-        bg_rgbs = (self.bg_intensity_range[0] + self.bg_intensity_range[1]) / 2
-      else:
-        # Sample RGB values from the range for each ray.
-        key, rng = random_split(rng)
-        bg_rgbs = random.uniform(
-            key,
-            shape=weights.shape[:-1] + (3,),
-            minval=self.bg_intensity_range[0],
-            maxval=self.bg_intensity_range[1])
-
-      # RawNeRF exposure logic.
-      if rays.exposure_idx is not None:
-        # Scale output colors by the exposure.
-        ray_results['rgb'] *= rays.exposure_values[..., None, :]
-        if self.learned_exposure_scaling:
-          exposure_idx = rays.exposure_idx[..., 0]
-          # Force scaling offset to always be zero when exposure_idx is 0.
-          # This constraint fixes a reference point for the scene's brightness.
-          mask = exposure_idx > 0
-          # Scaling is parameterized as an offset from 1.
-          scaling = 1 + mask[..., None] * exposure_scaling_offsets(exposure_idx)
-          ray_results['rgb'] *= scaling[..., None, :]
-
-      # Render each ray.
-      rendering = render.volumetric_rendering(
-          ray_results['rgb'],
-          weights,
-          tdist,
-          bg_rgbs,
-          rays.far,
-          compute_extras,
-          extras={
-              k: v
-              for k, v in ray_results.items()
-              if k.startswith('normals') or k in ['roughness']
-          })
-
-      if compute_extras:
-        # Collect some rays to visualize directly. By naming these quantities
-        # with `ray_` they get treated differently downstream --- they're
-        # treated as bags of rays, rather than image chunks.
-        n = self.config.vis_num_rays
-        rendering['ray_sdist'] = sdist.reshape([-1, sdist.shape[-1]])[:n, :]
-        rendering['ray_weights'] = (
-            weights.reshape([-1, weights.shape[-1]])[:n, :])
-        rgb = ray_results['rgb']
-        rendering['ray_rgbs'] = (rgb.reshape((-1,) + rgb.shape[-2:]))[:n, :, :]
-
-      renderings.append(rendering)
-      ray_results['sdist'] = jnp.copy(sdist)
-      ray_results['weights'] = jnp.copy(weights)
-      ray_history.append(ray_results)
-
-    if compute_extras:
-      # Because the proposal network doesn't produce meaningful colors, for
-      # easier visualization we replace their colors with the final average
-      # color.
-      weights = [r['ray_weights'] for r in renderings]
-      rgbs = [r['ray_rgbs'] for r in renderings]
-      final_rgb = jnp.sum(rgbs[-1] * weights[-1][..., None], axis=-2)
-      avg_rgbs = [
-          jnp.broadcast_to(final_rgb[:, None, :], r.shape) for r in rgbs[:-1]
-      ]
-      for i in range(len(avg_rgbs)):
-        renderings[i]['ray_rgbs'] = avg_rgbs[i]
-
-    return renderings, ray_history
-
-
-def construct_model(rng, rays, config, codebook):
-  """Construct a mip-NeRF 360 model.
-
-  Args:
-    rng: jnp.ndarray. Random number generator.
-    rays: an example of input Rays.
-    config: A Config class.
-
-  Returns:
-    model: initialized nn.Module, a NeRF model with parameters.
-    init_variables: flax.Module.state, initialized NeRF model parameters.
-  """
-  # Grab just 10 rays, to minimize memory overhead during construction.
-  ray = jax.tree_util.tree_map(lambda x: jnp.reshape(x, [-1, x.shape[-1]])[:10],
-                               rays)
-  model = Model(config=config,codebook=codebook)
-  init_variables = model.init(
-      rng,  # The RNG used by flax to initialize random weights.
-      rng=None,  # The RNG used by sampling within the model.
-      rays=ray,
-      train_frac=1.,
-      compute_extras=False,
-      zero_glo=model.num_glo_features == 0)
-  return model, init_variables
-
-@gin.configurable
-class MLP(nn.Module):
-  """A PosEnc MLP."""
-  codebook: jnp.ndarray
-  net_depth: int = 8  # The depth of the first part of MLP.
-  net_width: int = 256  # The width of the first part of MLP.
-  bottleneck_width: int = 256  # The width of the bottleneck vector.
-  net_depth_viewdirs: int = 1  # The depth of the second part of ML.
-  net_width_viewdirs: int = 128  # The width of the second part of MLP.
-  net_activation: Callable[..., Any] = nn.relu  # The activation function.
-  min_deg_point: int = 0  # Min degree of positional encoding for 3D points.
-  max_deg_point: int = 12  # Max degree of positional encoding for 3D points.
-  weight_init: str = 'he_uniform'  # Initializer for the weights of the MLP.
-  skip_layer: int = 4  # Add a skip connection to the output of every N layers.
-  skip_layer_dir: int = 4  # Add a skip connection to 2nd MLP every N layers.
-  num_rgb_channels: int = 3  # The number of RGB channels.
-  deg_view: int = 4  # Degree of encoding for viewdirs or refdirs.
-  use_reflections: bool = False  # If True, use refdirs instead of viewdirs.
-  use_directional_enc: bool = False  # If True, use IDE to encode directions.
-  # If False and if use_directional_enc is True, use zero roughness in IDE.
-  enable_pred_roughness: bool = False
-  # Roughness activation function.
-  roughness_activation: Callable[..., Any] = nn.softplus
-  roughness_bias: float = -1.  # Shift added to raw roughness pre-activation.
-  use_diffuse_color: bool = False  # If True, predict diffuse & specular colors.
-  use_specular_tint: bool = False  # If True, predict tint.
-  use_n_dot_v: bool = False  # If True, feed dot(n * viewdir) to 2nd MLP.
-  bottleneck_noise: float = 0.0  # Std. deviation of noise added to bottleneck.
-  density_activation: Callable[..., Any] = nn.softplus  # Density activation.
-  density_bias: float = -1.  # Shift added to raw densities pre-activation.
-  density_noise: float = 0.  # Standard deviation of noise added to raw density.
-  rgb_premultiplier: float = 1.  # Premultiplier on RGB before activation.
-  rgb_activation: Callable[..., Any] = nn.sigmoid  # The RGB activation.
-  rgb_bias: float = 0.  # The shift added to raw colors pre-activation.
-  rgb_padding: float = 0.001  # Padding added to the RGB outputs.
-  enable_pred_normals: bool = False  # If True compute predicted normals.
-  disable_density_normals: bool = False  # If True don't compute normals.
-  disable_rgb: bool = False  # If True don't output RGB.
-  warp_fn: Callable[..., Any] = None
-  basis_shape: str = 'icosahedron'  # `octahedron` or `icosahedron`.
-  basis_subdivisions: int = 2  # Tesselation count. 'octahedron' + 1 == eye(3).
-  input_dim: int = 3,
-  num_latents: int = 512
-  latent_dim: int = 256
-  latent_heads: int = 8
-  latent_dim_head=64
-  num_cross_depth: int = 1
-  cross_heads: int = 8
-  cross_dim_head: int = 128
-  decoder_ff: bool = True
-  ndepth: int = 1
-  activation: str = "softplus"
-  
-
-  
-  def setup(self,input_dim: int = 3,
-               num_latents: int = 8,
-               latent_dim: int = 128,
-               latent_heads: int = 4,
-               latent_dim_head=64,
-               num_cross_depth: int = 1,
-               cross_heads: int = 8,
-               cross_dim_head: int = 128,
-               decoder_ff: bool = True,
-               ndepth: int = 1,
-               activation: str = "softplus",):
-    # Make sure that normals are computed if reflection direction is used.
-    if self.use_reflections and not (self.enable_pred_normals or
-                                     not self.disable_density_normals):
-      raise ValueError('Normals must be computed for reflection directions.')
-
-    # Precompute and store (the transpose of) the basis being used.
-    self.pos_basis_t = jnp.array(
-        geopoly.generate_basis(self.basis_shape, self.basis_subdivisions)).T
-
-    # Precompute and define viewdir or refdir encoding function.
-    if self.use_directional_enc:
-      self.dir_enc_fn = ref_utils.generate_ide_fn(self.deg_view)
-    else:
-
-      def dir_enc_fn(direction, _):
-        return coord.pos_enc(
-            direction, min_deg=0, max_deg=self.deg_view, append_identity=True)
-
-      self.dir_enc_fn = dir_enc_fn
-    self.latents = self.param('latents', lambda key, shape: jnp.zeros(shape, dtype=jnp.float32),
-                              (self.num_latents, self.latent_dim))
+        codebook_dim = self.codebook.shape[1]
+        
+        self.codebook_attn = CodebookAttention(
+            codebook_dim=codebook_dim,
+            depth=ndepth,
+            num_latents=num_latents,
+            latent_dim=latent_dim,
+            latent_heads=latent_heads,
+            latent_dim_head=latent_dim_head,
+            cross_heads=cross_heads,
+            cross_dim_head=cross_dim_head
+        )
+        self.coordinate_attn = CoordinateAttention(
+            queries_dim=input_dim,
+            depth=num_cross_depth,
+            activation=activation,
+            latent_dim=latent_dim,
+            cross_heads=cross_heads,
+            cross_dim_head=cross_dim_head,
+            decoder_ff=decoder_ff
+        )
     
-    codebook_dim = self.codebook.shape[1]
-    
-    self.codebook_attn = CodebookAttention(
-      codebook_dim=codebook_dim,
-      depth=ndepth,
-      num_latents=num_latents,
-      latent_dim=latent_dim,
-      latent_heads=latent_heads,
-      latent_dim_head=latent_dim_head,
-      cross_heads=cross_heads,
-      cross_dim_head=cross_dim_head)
-  
-    self.coordinate_attn = CoordinateAttention(
-      queries_dim=input_dim,
-      depth=num_cross_depth,
-      activation=activation,
-      latent_dim=latent_dim,
-      cross_heads=cross_heads,
-      cross_dim_head=cross_dim_head,
-      decoder_ff=decoder_ff)
-     
+        pos_size = ((max_deg_point - min_deg_point) * 2) * self.pos_basis_t.shape[-1]
+        view_pos_size = (deg_view * 2 + 1) * 3
 
-      
-  @nn.compact
-  def __call__(self,
-               rng,
-               gaussians,
-               viewdirs=None,
-               imageplane=None,
-               glo_vec=None,
-               exposure=None,):
-    """Evaluate the MLP.
+        module = nn.Linear(pos_size, netwidth)
+        init.kaiming_uniform_(module.weight)
+        pts_linear = [module]
 
-    Args:
-      rng: jnp.ndarray. Random number generator.
-      gaussians: a tuple containing:                                           /
-        - mean: [..., n, 3], coordinate means, and                             /
-        - cov: [..., n, 3{, 3}], coordinate covariance matrices.
-      viewdirs: jnp.ndarray(float32), [..., 3], if not None, this variable will
-        be part of the input to the second part of the MLP concatenated with the
-        output vector of the first part of the MLP. If None, only the first part
-        of the MLP will be used with input x. In the original paper, this
-        variable is the view direction.
-      imageplane: jnp.ndarray(float32), [batch, 2], xy image plane coordinates
-        for each ray in the batch. Useful for image plane operations such as a
-        learned vignette mapping.
-      glo_vec: [..., num_glo_features], The GLO vector for each ray.
-      exposure: [..., 1], exposure value (shutter_speed * ISO) for each ray.
+        for idx in range(netdepth - 1):
+            if idx % skip_layer == 0 and idx > 0:
+                module = nn.Linear(netwidth + pos_size, netwidth)
+            else:
+                module = nn.Linear(netwidth, netwidth)
+            init.kaiming_uniform_(module.weight)
+            pts_linear.append(module)
 
-    Returns:
-      rgb: jnp.ndarray(float32), with a shape of [..., num_rgb_channels].
-      density: jnp.ndarray(float32), with a shape of [...].
-      normals: jnp.ndarray(float32), with a shape of [..., 3], or None.
-      normals_pred: jnp.ndarray(float32), with a shape of [..., 3], or None.
-      roughness: jnp.ndarray(float32), with a shape of [..., 1], or None.
-    """
+        self.pts_linear = nn.ModuleList(pts_linear)
+        self.density_layer = nn.Linear(netwidth, num_density_channels)
+        init.kaiming_uniform_(self.density_layer.weight)
 
-    dense_layer = functools.partial(
-        nn.Dense, kernel_init=getattr(jax.nn.initializers, self.weight_init)())
+        if not disable_rgb:
+            self.bottleneck_layer = nn.Linear(netwidth, bottleneck_width)
+            layer = nn.Linear(bottleneck_width + view_pos_size, netwidth_condition)
+            init.kaiming_uniform_(layer.weight)
+            views_linear = [layer]
+            for idx in range(netdepth_condition - 1):
+                if idx % skip_layer_dir == 0 and idx > 0:
+                    layer = nn.Linear(
+                        netwidth_condition + view_pos_size, netwidth_condition
+                    )
+                else:
+                    layer = nn.Linear(netwidth_condition, netwidth_condition)
+                init.kaiming_uniform_(layer.weight)
+                views_linear.append(layer)
+            self.views_linear = nn.ModuleList(views_linear)
 
-    density_key, rng = random_split(rng)
- 
- 
+            self.rgb_layer = nn.Linear(netwidth_condition, num_rgb_channels)
 
-    def predict_density(means, covs):
-      """Helper function to output density."""
-      # Encode input position
-      if self.warp_fn is not None:
-        means, covs = coord.track_linearize(self.warp_fn, means, covs)
+            init.kaiming_uniform_(self.bottleneck_layer.weight)
+            init.kaiming_uniform_(self.rgb_layer.weight)
 
-      lifted_means, lifted_vars = (
-          coord.lift_and_diagonalize(means, covs, self.pos_basis_t))
-      x = coord.integrated_pos_enc(lifted_means, lifted_vars,
-                                   self.min_deg_point, self.max_deg_point)
-      codebook = self.codebook
-      codebook = repeat(codebook, "n d -> b n d", b=4096)
-      #codebook
-      
-      print("x:",x.shape)
-      latents = self.codebook_attn(codebook)
-      print("latents:",latents.shape)
-      if x.ndim==5:
-        b,n_1,n_2,n_3,c=x.shape
-        m=x.size
-        #latent = self.call("codebook_attn",codebook)
-        xx = x.reshape((b, int(m/(3*b)), 3))
-        #xx = x.reshape((b, int(m/(3*b)), 3))
-        print("xx:",xx.shape)
-        print('Output shape from CoordinateAttention:', self.coordinate_attn(xx, latents).shape)
+        self.dir_enc_fn = helper.pos_enc
+
+    def predict_density(self, means, covs, randomized, is_train):
+
+        means, covs = self.warp_fn(means, covs, is_train)
+
+        lifted_means, lifted_vars = helper.lift_and_diagonalize(
+            means, covs, self.pos_basis_t)
+        x = helper.integrated_pos_enc(
+            lifted_means, lifted_vars, self.min_deg_point, self.max_deg_point)
+        
+        points = x
+        b, n, c = x.shape
+        #print(b,n,c)
+        codebook = self.codebook
+        if codebook.ndim == 2:
+            codebook = repeat(codebook, "n d -> b n d", b=b)
+        latents = self.codebook_attn(codebook)
+        
+        xx = x.view((b, int(n*c/3), 3))
         points = self.coordinate_attn(xx, latents)
-        x = points.reshape((b , n_1, n_2, n_3, c))
-    
-      #if codebook.ndim == 2:
-      #codebook = repeat(codebook, "n d -> b n d", b=b)
-      #print("x:",x.shape)
-      
-      
-      inputs = x
-      # Evaluate network to produce the output density.
-      for i in range(self.net_depth):
-        x = dense_layer(self.net_width)(x)
-        x = self.net_activation(x)
-        if i % self.skip_layer == 0 and i > 0:
-          x = jnp.concatenate([x, inputs], axis=-1)
-      raw_density = dense_layer(1)(x)[..., 0]  # Hardcoded to a single channel.
-      # Add noise to regularize the density predictions if needed.
-      if (density_key is not None) and (self.density_noise > 0):
-        raw_density += self.density_noise * random.normal(
-            density_key, raw_density.shape)
-      return raw_density, x
-
-    means, covs = gaussians
-    if self.disable_density_normals:
-      raw_density, x = predict_density(means, covs)
-      raw_grad_density = None
-      normals = None
-    else:
-      # Flatten the input so value_and_grad can be vmap'ed.
-      means_flat = means.reshape((-1, means.shape[-1]))
-      covs_flat = covs.reshape((-1,) + covs.shape[len(means.shape) - 1:])
-
-      # Evaluate the network and its gradient on the flattened input.
-      predict_density_and_grad_fn = jax.vmap(
-          jax.value_and_grad(predict_density, has_aux=True), in_axes=(0, 0))
-      (raw_density_flat, x_flat), raw_grad_density_flat = (
-          predict_density_and_grad_fn(means_flat, covs_flat))
-
-      # Unflatten the output.
-      raw_density = raw_density_flat.reshape(means.shape[:-1])
-      x = x_flat.reshape(means.shape[:-1] + (x_flat.shape[-1],))
-      raw_grad_density = raw_grad_density_flat.reshape(means.shape)
-
-      # Compute normal vectors as negative normalized density gradient.
-      # We normalize the gradient of raw (pre-activation) density because
-      # it's the same as post-activation density, but is more numerically stable
-      # when the activation function has a steep or flat gradient.
-      normals = -ref_utils.l2_normalize(raw_grad_density)
-
-    if self.enable_pred_normals:
-      grad_pred = dense_layer(3)(x)
-
-      # Normalize negative predicted gradients to get predicted normal vectors.
-      normals_pred = -ref_utils.l2_normalize(grad_pred)
-      normals_to_use = normals_pred
-    else:
-      grad_pred = None
-      normals_pred = None
-      normals_to_use = normals
-
-    # Apply bias and activation to raw density
-    density = self.density_activation(raw_density + self.density_bias)
-
-    roughness = None
-    if self.disable_rgb:
-      rgb = jnp.zeros_like(means)
-    else:
-      if viewdirs is not None:
-        # Predict diffuse color.
-        if self.use_diffuse_color:
-          raw_rgb_diffuse = dense_layer(self.num_rgb_channels)(x)
-
-        if self.use_specular_tint:
-          tint = nn.sigmoid(dense_layer(3)(x))
-
-        if self.enable_pred_roughness:
-          raw_roughness = dense_layer(1)(x)
-          roughness = (
-              self.roughness_activation(raw_roughness + self.roughness_bias))
-
-        # Output of the first part of MLP.
-        if self.bottleneck_width > 0:
-          bottleneck = dense_layer(self.bottleneck_width)(x)
-
-          # Add bottleneck noise.
-          if (rng is not None) and (self.bottleneck_noise > 0):
-            key, rng = random_split(rng)
-            bottleneck += self.bottleneck_noise * random.normal(
-                key, bottleneck.shape)
-
-          x = [bottleneck]
-        else:
-          x = []
-
-        # Encode view (or reflection) directions.
-        if self.use_reflections:
-          # Compute reflection directions. Note that we flip viewdirs before
-          # reflecting, because they point from the camera to the point,
-          # whereas ref_utils.reflect() assumes they point toward the camera.
-          # Returned refdirs then point from the point to the environment.
-          refdirs = ref_utils.reflect(-viewdirs[..., None, :], normals_to_use)
-          # Encode reflection directions.
-          dir_enc = self.dir_enc_fn(refdirs, roughness)
-        else:
-          # Encode view directions.
-          dir_enc = self.dir_enc_fn(viewdirs, roughness)
-
-          dir_enc = jnp.broadcast_to(
-              dir_enc[..., None, :],
-              bottleneck.shape[:-1] + (dir_enc.shape[-1],))
-
-        # Append view (or reflection) direction encoding to bottleneck vector.
-        x.append(dir_enc)
-
-        # Append dot product between normal vectors and view directions.
-        if self.use_n_dot_v:
-          dotprod = jnp.sum(
-              normals_to_use * viewdirs[..., None, :], axis=-1, keepdims=True)
-          x.append(dotprod)
-
-        # Append GLO vector if used.
-        if glo_vec is not None:
-          glo_vec = jnp.broadcast_to(glo_vec[..., None, :],
-                                     bottleneck.shape[:-1] + glo_vec.shape[-1:])
-          x.append(glo_vec)
-
-        # Concatenate bottleneck, directional encoding, and GLO.
-        x = jnp.concatenate(x, axis=-1)
-
-        # Output of the second part of MLP.
+        x = points.view((b , n, c))
+        #x = torch.cat([points, x], dim=-1)
+       
         inputs = x
-        for i in range(self.net_depth_viewdirs):
-          x = dense_layer(self.net_width_viewdirs)(x)
-          x = self.net_activation(x)
-          if i % self.skip_layer_dir == 0 and i > 0:
-            x = jnp.concatenate([x, inputs], axis=-1)
+        for idx in range(self.netdepth):
+            x = self.pts_linear[idx](x)
+            x = self.net_activation(x)
+            if idx % self.skip_layer == 0 and idx > 0:
+                x = torch.cat([x, inputs], dim=-1)
 
-      # If using diffuse/specular colors, then `rgb` is treated as linear
-      # specular color. Otherwise it's treated as the color itself.
-      rgb = self.rgb_activation(self.rgb_premultiplier *
-                                dense_layer(self.num_rgb_channels)(x) +
-                                self.rgb_bias)
+        raw_density = self.density_layer(x)[..., 0]
+        if self.density_noise > 0.0 and randomized:
+            raw_density += self.density_noise * torch.rand_like(raw_density)
 
-      if self.use_diffuse_color:
-        # Initialize linear diffuse color around 0.25, so that the combined
-        # linear color is initialized around 0.5.
-        diffuse_linear = nn.sigmoid(raw_rgb_diffuse - jnp.log(3.0))
-        if self.use_specular_tint:
-          specular_linear = tint * rgb
+        return raw_density, x
+
+    def forward(self, gaussians, viewdirs, randomized, is_train):
+
+        means, covs = gaussians
+
+        raw_density, x = self.predict_density(means, covs, randomized, is_train)
+        density = self.density_activation(raw_density + self.density_bias)
+
+        if self.disable_rgb:
+            rgb = torch.zeros_like(means)
+            return {
+                "density": density,
+                "rgb": rgb,
+            }
+
+        bottleneck = self.bottleneck_layer(x)
+        if self.bottleneck_noise > 0.0 and randomized:
+            bottleneck += torch.rand_like(bottleneck) * self.bottleneck_noise
+        x = [bottleneck]
+
+        dir_enc = self.dir_enc_fn(viewdirs, 0, self.deg_view, True)
+        dir_enc = torch.broadcast_to(
+            dir_enc[..., None, :], bottleneck.shape[:-1] + (dir_enc.shape[-1],)
+        )
+        x.append(dir_enc)
+        x = torch.cat(x, dim=-1)
+
+        inputs = x
+        for idx in range(self.netdepth_condition):
+            x = self.views_linear[idx](x)
+            x = self.net_activation(x)
+            if idx % self.skip_layer_dir == 0 and idx > 0:
+                x = torch.cat([x, inputs], dim=-1)
+
+        x = self.rgb_layer(x)
+        rgb = self.rgb_activation(self.rgb_premultiplier * x + self.rgb_bias)
+        rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+
+        return {
+            "density": density,
+            "rgb": rgb,
+        }
+
+
+@gin.configurable()
+class NeRFMLP(MipNeRF360MLP):
+    def __init__(
+        self,
+        codebook,
+        netdepth: int = 8,
+        netwidth: int = 1024,
+        ):
+        super(NeRFMLP, self).__init__(codebook=codebook,netdepth=netdepth, netwidth=netwidth,)
+
+
+@gin.configurable()
+class PropMLP(MipNeRF360MLP):
+    def __init__(
+        self,
+        codebook,
+        netdepth: int = 4,
+        netwidth: int = 256,
+        ):
+        super(PropMLP, self).__init__(
+            codebook=codebook,netdepth=netdepth, netwidth=netwidth, disable_rgb=True,
+        )
+
+
+@gin.configurable()
+class MipNeRF360(nn.Module):
+    def __init__(
+        self,
+        codebook,
+        input_dim: int = 3,
+        num_prop_samples: int = 8,
+        num_nerf_samples: int = 4,
+        #num_nerf_samples: int = 32,
+        num_levels: int = 3,
+        bg_intensity_range: Tuple[float] = (1.0, 1.0),
+        anneal_slope: int = 10,
+        stop_level_grad: bool = True,
+        use_viewdirs: bool = True,
+        ray_shape: str = "cone",
+        disable_integration: bool = False,
+        single_jitter: bool = True,
+        dilation_multiplier: float = 0.5,
+        dilation_bias: float = 0.0025,
+        near_anneal_rate: Optional[float] = None,
+        near_anneal_init: float = 0.95,
+        single_mlp: bool = False,
+        resample_padding: float = 0.0,
+        use_gpu_resampling: bool = False,
+        opaque_background: bool = False,
+        ):
+        super(MipNeRF360, self).__init__()
+        for name, value in vars().items():
+            if name not in ["self", "__class__"]:
+                setattr(self, name, value)
+        
+        #super(MipNeRF360, self).__init__()
+        
+        
+        
+        self.mlps = nn.ModuleList(
+            [PropMLP(codebook) for _ in range(num_levels - 1)]
+            + [
+                NeRFMLP(codebook),
+            ]
+        )
+
+        
+
+    def forward(self, batch, train_frac, randomized, is_train, near, far):
+
+        bsz, _ = batch["rays_o"].shape
+        device = batch["rays_o"].device
+        
+
+        _, s_to_t = helper.construct_ray_warps(near, far)
+        if self.near_anneal_rate is None:
+            init_s_near = 0.0
         else:
-          specular_linear = 0.5 * rgb
+            init_s_near = 1 - train_frac / self.near_anneal_rate
+            init_s_near = max(min(init_s_near, 1), 0)
+        init_s_far = 1.0
+        
+        sdist = torch.cat(
+            [
+                torch.full((bsz, 1), init_s_near, device=device),
+                torch.full((bsz, 1), init_s_far, device=device),
+            ],
+            dim=-1,
+        )
 
-        # Combine specular and diffuse components and tone map to sRGB.
-        rgb = jnp.clip(
-            image.linear_to_srgb(specular_linear + diffuse_linear), 0.0, 1.0)
+        weights = torch.ones(bsz, 1, device=device)
+        prod_num_samples = 1
 
-      # Apply padding, mapping color to [-rgb_padding, 1+rgb_padding].
-      rgb = rgb * (1 + 2 * self.rgb_padding) - self.rgb_padding
+        ray_history = []
+        renderings = []
 
-    return dict(
-        density=density,
-        rgb=rgb,
-        raw_grad_density=raw_grad_density,
-        grad_pred=grad_pred,
-        normals=normals,
-        normals_pred=normals_pred,
-        roughness=roughness,
-    )
+        for i_level in range(self.num_levels):
+            is_prop = i_level < (self.num_levels - 1)
+            num_samples = self.num_prop_samples if is_prop else self.num_nerf_samples
+
+            dilation = (
+                self.dilation_bias
+                + self.dilation_multiplier
+                * (init_s_far - init_s_near)
+                / prod_num_samples
+            )
+
+            prod_num_samples *= num_samples
+
+            use_dilation = self.dilation_bias > 0 or self.dilation_multiplier > 0
+
+            if i_level > 0 and use_dilation:
+                sdist, weights = helper.max_dilate_weights(
+                    sdist,
+                    weights,
+                    dilation,
+                    domain=(init_s_near, init_s_far),
+                    renormalize=True,
+                )
+                sdist = sdist[..., 1:-1]
+                weights = weights[..., 1:-1]
+
+            if self.anneal_slope > 0:
+                bias = lambda x, s: (s * x) / ((s - 1) * x + 1)
+                anneal = bias(train_frac, self.anneal_slope)
+            else:
+                anneal = 1.0
+
+            logits_resample = torch.where(
+                sdist[..., 1:] > sdist[..., :-1],
+                anneal * torch.log(weights + self.resample_padding),
+                torch.full_like(weights, -torch.inf),
+            )
+    
+            sdist = helper.sample_intervals(
+                randomized,
+                sdist,
+                logits_resample,
+                num_samples,
+                single_jitter=self.single_jitter,
+                domain=(init_s_near, init_s_far),
+            )
+            
+            if self.stop_level_grad:
+                sdist = sdist.detach()
+            
+            tdist = s_to_t(sdist)
+
+            gaussians = helper.cast_rays(
+                tdist,
+                batch["rays_o"],
+                batch["rays_d"],
+                batch["radii"],
+                self.ray_shape,
+                diag=False,
+            )
+
+            if self.disable_integration:
+                gaussians = (gaussians[0], torch.zeros_like(gaussians[1]))
+
+            ray_results = self.mlps[i_level](
+                gaussians, batch["viewdirs"], randomized, is_train
+            )
+
+            weights = helper.compute_alpha_weights(
+                ray_results["density"],
+                tdist,
+                batch["rays_d"],
+                opaque_background=self.opaque_background,
+            )[0]
+
+            if self.bg_intensity_range[0] == self.bg_intensity_range[1]:
+                bg_rgbs = self.bg_intensity_range[0]
+            elif not randomized:
+                bg_rgbs = (
+                    self.bg_intensity_range[0] + self.bg_intensity_range[1]
+                ) / 2.0
+            else:
+                bg_rgbs = (
+                    torch.rand(3)
+                    * (self.bg_intensity_range[1] - self.bg_intensity_range[0])
+                    + self.bg_intensity_range[0]
+                )
+
+            rendering = helper.volumetric_rendering(
+                ray_results["rgb"],
+                weights,
+                tdist,
+                bg_rgbs,
+                far,
+                False,
+            )
+
+            ray_results["sdist"] = sdist
+            ray_results["weights"] = weights
+
+            ray_history.append(ray_results)
+            renderings.append(rendering)
+
+        return renderings, ray_history
 
 
-@gin.configurable
-class NerfMLP(MLP):
-  pass
+class LitMipNeRF360(LitModel):
+    def __init__(
+        self,
+        #codebook,
+        lr_init: float = 2.0e-3,
+        lr_final: float = 2.0e-5,
+        lr_delay_steps: int = 512,
+        lr_delay_mult: float = 0.01,
+        data_loss_mult: float = 1.0,
+        interlevel_loss_mult: float = 1.0,
+        distortion_loss_mult: float = 0.01,
+        charb_padding: float = 0.001,
+        ):
+        super(LitMipNeRF360, self).__init__()
+        for name, value in vars().items():
+            if name not in ["self", "__class__"]:
+                setattr(self, name, value)
+        
+        #super(LitMipNeRF360, self).__init__()
+        
+        
+        # load codebook
+        
+        vq_path = "/apdcephfs/share_1227775/fukunyin/fdu/yyy/checkpoint/code.ckpt"
+        code_data = torch.load(vq_path, map_location="cpu")
+        state_dict = code_data.get("state_dict", {})
+        #codebook = state_dict["quantize.embedding.weight"]
+        
+        codebook_m = state_dict["quantize.embedding.weight"]
+        text_mode,preprocess = clip.load("ViT-B/32","cuda",jit=False)
+        sentence_embeddings = clip.tokenize(["the opera house in sydney, australia",
+"the opera house in sydney",
+"the opera house in sydney",
+"the building is white",
+"the water is blue",
+"the opera house in sydney",
+"the buildings on the water",
+"the opera house in sydney",
+"the buildings on the water",
+"the opera house in sydney",
+"the opera house in sydney",
+"the opera house in sydney",
+"the opera house in sydney",
+"the buildings on the water",
+"the buildings on the water",
+"the buildings on the water",
+"the buildings on the water",
+"the buildings on the water",
+"the sydney opera house on the water",
+"the opera house in sydney",
+"the opera house in sydney",
+"the opera house in sydney, australia",
+"the opera house in sydney",
+"the roof of the opera house",
+"the opera house in sydney",
+"the water is green",
+"the opera house in sydney, australia",
+"the opera house in sydney",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the opera house in sydney",
+"the building is white",
+"the building is white",
+"the opera house in sydney",
+"the opera house in sydney, australia",
+"the building is white",
+"the opera house in sydney",
+"the opera house in sydney",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the opera house in sydney",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia"
+"sydney opera house in the morning",
+"the opera house in sydney, australia",
+"the sydney opera house",
+"the sydney opera house",
+"the opera house in sydney",
+"the building is white",
+"the sydney opera house",
+"the opera house in sydney",
+"the sydney opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"aerial view of the sydney opera house",
+"aerial view of the sydney opera house",
+"sydney opera house in the sydney harbour",
+"the sydney opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"the opera house in sydney harbour",
+"the sydney opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"the opera house in sydney",
+"the opera house in sydney harbour",
+"sydney opera house in the morning",
+"the opera house in sydney, australia",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"the opera house in sydney, australia",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"the opera house in sydney, australia",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"the opera house in sydney, australia",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"the opera house in sydney, australia",
+"sydney opera house in the morning",
+"the opera house in sydney, australia",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"sydney opera house in the morning",
+"the sydney opera house in sydney, australia",
+"sydney opera house in the morning",
+"the opera house in sydney",
+"the opera house in sydney, australia",
+"sydney opera house in the morning",
+"the opera house in sydney",
+"aerial view of the sydney opera house",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"filming location in the morning",
+"filming location in the morning",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the sails of the opera house",
+"the opera house in sydney, australia",
+" the opera house in sydney, australia",
+"the opera house in sydney",
+"the opera house in sydney, australia",
+"the opera house in sydney",
+"aerial shot of the sails",
+"the opera house in sydney, australia",
+"the opera house in sydney",
+"the opera house in sydney",
+"the opera house in sydney",
+"the opera house in sydney",
+"the opera house in sydney",
+"the building is white",
+"the building is white",
+"the opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"the opera house in sydney",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the opera house in sydney, australia",
+"the building is white",
+"the opera house in sydney, australia",
+"the building is white",
+"the opera house in sydney, australia",
+"the building is white",
+"the opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the building is white",
+"the sydney opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the building is white",
+"the opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"the building is white",
+"the sydney opera house in sydney, australia",
+"the opera house in sydney, australia",
+"the building is white",
+"the sydney opera house in sydney, australia",
+"the building is white",
+"the sydney opera house in sydney, australia",
+"the building is white",
+"the building is white",
+"the building is white",
+"the sydney opera house in sydney, australia",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"the sydney opera house in sydney, australia",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",
+"the building is white",]).cuda()
+        with torch.no_grad():
+            sentence_embeddings = text_mode.encode_text(sentence_embeddings)
+            text_embeddings = sentence_embeddings.unsqueeze(0).float()
+        print("text_embedding:",text_embeddings.shape)
+        text_embeddings = text_embeddings.reshape(382,256)
+        codebook_m=codebook_m.cuda()
+        #codebook = torch.cat([codebook_m,text_embeddings],dim=0)
+        codebook = torch.cat([text_embeddings,codebook_m],dim=0)
+        #print("text_embeddings:",text_embeddings.shape)
+       
+        self.model = MipNeRF360(codebook)
 
+         
 
+    def setup(self, stage):
+        self.near = self.trainer.datamodule.near
+        self.far = self.trainer.datamodule.far
+        self.white_bkgd = self.trainer.datamodule.white_bkgd
 
-@gin.configurable
-class PropMLP(MLP):
-  pass
+    def training_step(self, batch, batch_idx):
+        max_steps = self.trainer.max_steps
+        train_frac = self.global_step / max_steps
+        rendered_results, ray_history = self.model(
+            batch, train_frac, True, True, self.near, self.far
+        )
+        rgb = rendered_results[-1]["rgb"]
+        target = batch["target"]
+        
+        rgbloss = helper.img2mse(rgb, target)
 
+        loss = 0.0
+        loss = (
+            loss + torch.sqrt(rgbloss + self.charb_padding**2) * self.data_loss_mult
+        )
+        loss = loss + self.interlevel_loss(ray_history) * self.interlevel_loss_mult
+        loss = loss + self.distortion_loss(ray_history) * self.distortion_loss_mult
 
-def render_image(render_fn: Callable[[jnp.array, utils.Rays],
-                                     Tuple[List[Mapping[Text, jnp.ndarray]],
-                                           List[Tuple[jnp.ndarray, ...]]]],
-                 rays: utils.Rays,
-                 rng: jnp.array,
-                 config: configs.Config,
-                 verbose: bool = True) -> MutableMapping[Text, Any]:
-  """Render all the pixels of an image (in test mode).
+        psnr = helper.mse2psnr(rgbloss)
 
-  Args:
-    render_fn: function, jit-ed render function mapping (rng, rays) -> pytree.
-    rays: a `Rays` pytree, the rays to be rendered.
-    rng: jnp.ndarray, random number generator (used in training mode only).
-    config: A Config class.
-    verbose: print progress indicators.
+        self.log("train/loss", loss.item(), on_step=True, prog_bar=True)
+        self.log("train/psnr", psnr.item(), on_step=True, prog_bar=True)
 
-  Returns:
-    rgb: jnp.ndarray, rendered color image.
-    disp: jnp.ndarray, rendered disparity image.
-    acc: jnp.ndarray, rendered accumulated weights per pixel.
-  """
-  height, width = rays.origins.shape[:2]
-  num_rays = height * width
-  rays = jax.tree_util.tree_map(lambda r: r.reshape((num_rays, -1)), rays)
+        return loss
 
-  host_id = jax.process_index()
-  chunks = []
-  idx0s = range(0, num_rays, config.render_chunk_size)
-  for i_chunk, idx0 in enumerate(idx0s):
-    # pylint: disable=cell-var-from-loop
-    if verbose and i_chunk % max(1, len(idx0s) // 10) == 0:
-      print(f'Rendering chunk {i_chunk}/{len(idx0s)-1}')
-    chunk_rays = (
-        jax.tree_util.tree_map(
-            lambda r: r[idx0:idx0 + config.render_chunk_size], rays))
-    actual_chunk_size = chunk_rays.origins.shape[0]
-    rays_remaining = actual_chunk_size % jax.device_count()
-    if rays_remaining != 0:
-      padding = jax.device_count() - rays_remaining
-      chunk_rays = jax.tree_util.tree_map(
-          lambda r: jnp.pad(r, ((0, padding), (0, 0)), mode='edge'), chunk_rays)
-    else:
-      padding = 0
-    # After padding the number of chunk_rays is always divisible by host_count.
-    rays_per_host = chunk_rays.origins.shape[0] // jax.process_count()
-    start, stop = host_id * rays_per_host, (host_id + 1) * rays_per_host
-    chunk_rays = jax.tree_util.tree_map(lambda r: utils.shard(r[start:stop]),
-                                        chunk_rays)
-    chunk_renderings, _ = render_fn(rng, chunk_rays)
+    def render_rays(self, batch, batch_idx):
+        ret = {}
 
-    # Unshard the renderings.
-    chunk_renderings = jax.tree_util.tree_map(
-        lambda v: utils.unshard(v[0], padding), chunk_renderings)
+        max_steps = self.trainer.max_steps
+        train_frac = self.global_step / max_steps
+        rendered_results, ray_history = self.model(
+            batch, train_frac, False, False, self.near, self.far
+        )
+        rgb = rendered_results[-1]["rgb"]
+        target = batch["target"]
+        ret["target"] = target
+        ret["rgb"] = rgb
+        return ret
 
-    # Gather the final pass for 2D buffers and all passes for ray bundles.
-    chunk_rendering = chunk_renderings[-1]
-    for k in chunk_renderings[0]:
-      if k.startswith('ray_'):
-        chunk_rendering[k] = [r[k] for r in chunk_renderings]
+    def validation_step(self, batch, batch_idx):
+        return self.render_rays(batch, batch_idx)
 
-    chunks.append(chunk_rendering)
+    def test_step(self, batch, batch_idx):
+        return self.render_rays(batch, batch_idx)
 
-  # Concatenate all chunks within each leaf of a single pytree.
-  rendering = (
-      jax.tree_util.tree_map(lambda *args: jnp.concatenate(args), *chunks))
-  for k, z in rendering.items():
-    if not k.startswith('ray_'):
-      # Reshape 2D buffers into original image shape.
-      rendering[k] = z.reshape((height, width) + z.shape[1:])
+    def configure_optimizers(self):
+        return torch.optim.Adam(
+            params=self.parameters(), lr=self.lr_init, betas=(0.9, 0.999)
+        )
 
-  # After all of the ray bundles have been concatenated together, extract a
-  # new random bundle (deterministically) from the concatenation that is the
-  # same size as one of the individual bundles.
-  keys = [k for k in rendering if k.startswith('ray_')]
-  if keys:
-    num_rays = rendering[keys[0]][0].shape[0]
-    ray_idx = random.permutation(random.PRNGKey(0), num_rays)
-    ray_idx = ray_idx[:config.vis_num_rays]
-    for k in keys:
-      rendering[k] = [r[ray_idx] for r in rendering[k]]
+    def optimizer_step(
+        self,
+        epoch,
+        batch_idx,
+        optimizer,
+        optimizer_idx,
+        optimizer_closure,
+        on_tpu,
+        using_native_amp,
+        using_lbfgs,
+        ):
+        step = self.trainer.global_step
+        max_steps = gin.query_parameter("run.max_steps")
 
-  return rendering
-Donation is not implemented for cpu. See an explanation at https://jax.readthedocs.io/en/latest/faq.html#buffer-donation.
-  
+        if self.lr_delay_steps > 0:
+            delay_rate = self.lr_delay_mult + (1 - self.lr_delay_mult) * np.sin(
+                0.5 * np.pi * np.clip(step / self.lr_delay_steps, 0, 1)
+            )
+        else:
+            delay_rate = 1.0
 
-codebook_np = codebook_torch.numpy()
+        t = np.clip(step / max_steps, 0, 1)
+        scaled_lr = np.exp(np.log(self.lr_init) * (1 - t) + np.log(self.lr_final) * t)
+        new_lr = delay_rate * scaled_lr
 
-2023-03-12 01:52:51.562 [horovod|11.216.72.237] TypeError: can't convert cuda:0 device type tensor to numpy. Use Tensor.cpu() to copy the tensor to host memory first.
+        for pg in optimizer.param_groups:
+            pg["lr"] = new_lr
+
+        optimizer.step(closure=optimizer_closure)
+
+    
+    def validation_epoch_end(self, outputs):
+        val_image_sizes = self.trainer.datamodule.val_image_sizes
+        rgbs = self.alter_gather_cat(outputs, "rgb", val_image_sizes)
+        targets = self.alter_gather_cat(outputs, "target", val_image_sizes)
+        psnr_mean = self.psnr_each(rgbs, targets).mean()
+        ssim_mean = self.ssim_each(rgbs, targets).mean()
+        lpips_mean = self.lpips_each(rgbs, targets).mean()
+        self.log("val/psnr", psnr_mean.item(), on_epoch=True, sync_dist=True)
+        self.log("val/ssim", ssim_mean.item(), on_epoch=True, sync_dist=True)
+        self.log("val/lpips", lpips_mean.item(), on_epoch=True, sync_dist=True)
+
+    def test_epoch_end(self, outputs):
+        dmodule = self.trainer.datamodule
+        all_image_sizes = (
+            dmodule.all_image_sizes
+            if not dmodule.eval_test_only
+            else dmodule.test_image_sizes
+        )
+        rgbs = self.alter_gather_cat(outputs, "rgb", all_image_sizes)
+        targets = self.alter_gather_cat(outputs, "target", all_image_sizes)
+        psnr = self.psnr(rgbs, targets, dmodule.i_train, dmodule.i_val, dmodule.i_test)
+        ssim = self.ssim(rgbs, targets, dmodule.i_train, dmodule.i_val, dmodule.i_test)
+        lpips = self.lpips(
+            rgbs, targets, dmodule.i_train, dmodule.i_val, dmodule.i_test
+        )
+
+        self.log("test/psnr", psnr["test"], on_epoch=True, sync_dist=True)
+        self.log("test/ssim", ssim["test"], on_epoch=True, sync_dist=True)
+        self.log("test/lpips", lpips["test"], on_epoch=True, sync_dist=True)
+
+        if self.trainer.is_global_zero:
+            image_dir = os.path.join(self.logdir, "render_model")
+            os.makedirs(image_dir, exist_ok=True)
+            store_image(image_dir, rgbs)
+
+            result_path = os.path.join(self.logdir, "results.json")
+            self.write_stats(result_path, psnr, ssim, lpips)
+
+        return psnr, ssim, lpips
+
+    def interlevel_loss(self, ray_history):
+        last_ray_results = ray_history[-1]
+        c = last_ray_results["sdist"].detach()
+        w = last_ray_results["weights"].detach()
+        loss_interlevel = 0.0
+        for ray_results in ray_history[:-1]:
+            cp = ray_results["sdist"]
+            wp = ray_results["weights"]
+            loss_interlevel += torch.mean(helper.lossfun_outer(c, w, cp, wp))
+        return loss_interlevel
+
+    def distortion_loss(self, ray_history):
+        last_ray_results = ray_history[-1]
+        c = last_ray_results["sdist"]
+        w = last_ray_results["weights"]
+        loss = torch.mean(helper.lossfun_distortion(c, w))
+        return loss
